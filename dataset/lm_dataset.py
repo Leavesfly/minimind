@@ -35,24 +35,66 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.2):
     return prompt_content
 
 class PretrainDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_length=512):
+    """
+    预训练数据集，初始化时一次性 tokenize 全部数据并缓存为 tensor。
+
+    针对 Apple Silicon 统一内存架构优化：
+    - 传入 device='mps' 时，数据直接放在 GPU 上，训练时零拷贝
+    - vocab_size < 32767 时自动使用 int16 存储，内存减少 75%
+    - __getitem__ 只做 tensor 索引，纳秒级返回
+    """
+
+    def __init__(self, data_path, tokenizer, max_length=512, device=None):
         super().__init__()
-        self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = load_dataset('json', data_files=data_path, split='train')
+        raw_samples = load_dataset('json', data_files=data_path, split='train')
+
+        bos_id = tokenizer.bos_token_id
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id
+
+        # vocab_size < 32767 时用 int16 存储，节省 75% 内存
+        # labels 中有 -100（ignore_index），int16 范围 [-32768, 32767] 可以容纳
+        use_compact = (tokenizer.vocab_size < 32767)
+        storage_dtype = torch.int16 if use_compact else torch.long
+
+        print(f'Pre-tokenizing {len(raw_samples)} samples (storage: {storage_dtype})...', flush=True)
+        all_input_ids = []
+        all_labels = []
+        for sample in raw_samples:
+            tokens = tokenizer(
+                str(sample['text']),
+                add_special_tokens=False,
+                max_length=max_length - 2,
+                truncation=True
+            ).input_ids
+            tokens = [bos_id] + tokens + [eos_id]
+            padding_len = max_length - len(tokens)
+            input_ids = tokens + [pad_id] * padding_len
+            labels = list(input_ids)
+            for i in range(len(labels)):
+                if labels[i] == pad_id:
+                    labels[i] = -100
+            all_input_ids.append(input_ids)
+            all_labels.append(labels)
+
+        self.input_ids = torch.tensor(all_input_ids, dtype=storage_dtype)
+        self.labels = torch.tensor(all_labels, dtype=storage_dtype)
+
+        mem_mb = (self.input_ids.nbytes + self.labels.nbytes) / 1024 ** 2
+        print(f'Pre-tokenize done. Shape: {self.input_ids.shape}, memory: {mem_mb:.1f}MB', flush=True)
+
+        # 统一内存架构：数据直接放到 GPU 上，训练时零拷贝
+        if device is not None and str(device) != 'cpu':
+            print(f'Moving dataset to {device} (unified memory, zero-copy access)...', flush=True)
+            self.input_ids = self.input_ids.to(device)
+            self.labels = self.labels.to(device)
 
     def __len__(self):
-        return len(self.samples)
+        return self.input_ids.shape[0]
 
     def __getitem__(self, index):
-        sample = self.samples[index]
-        tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
-        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
-        input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
-        input_ids = torch.tensor(input_ids, dtype=torch.long)
-        labels = input_ids.clone()
-        labels[input_ids == self.tokenizer.pad_token_id] = -100
-        return input_ids, labels
+        return self.input_ids[index].long(), self.labels[index].long()
 
 
 class SFTDataset(Dataset):

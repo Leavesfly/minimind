@@ -4,3 +4,7 @@ __pycache__/
 out
 website/
 docs-minimind/
+.dataset
+venv/
+minimind-3
+.idea

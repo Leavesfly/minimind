@@ -23,7 +23,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import AgentRLDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
+from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel, get_default_device, get_device_type
 from trainer.rollout_engine import create_rollout_engine, compute_per_token_logps
 
 warnings.filterwarnings('ignore')
@@ -375,7 +375,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=2, help="批次大小")
     parser.add_argument("--learning_rate", type=float, default=3e-7, help="学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
+    parser.add_argument("--device", type=str, default=get_default_device(), help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="数据类型 bfloat16/float16")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
@@ -388,7 +388,7 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=1024, type=int, help="最大序列长度")
     parser.add_argument("--max_gen_len", type=int, default=768, help="单次最大生成长度")
     parser.add_argument("--max_total_len", type=int, default=2500, help="训练侧最终总长度上界")
-    parser.add_argument("--data_path", type=str, default="../dataset/agent_rl.jsonl", help="训练数据路径")
+    parser.add_argument("--data_path", type=str, default="../.dataset/agent_rl.jsonl", help="训练数据路径")
     parser.add_argument("--num_generations", type=int, default=4, help="每个prompt生成数量")
     parser.add_argument("--beta", type=float, default=0.1, help="KL散度惩罚系数")
     parser.add_argument("--loss_type", type=str, default="cispo", choices=["grpo", "cispo"], help="loss类型")
@@ -412,15 +412,28 @@ if __name__ == "__main__":
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
+    Logger(f'Training device: {args.device}')
 
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
 
-    device_type = "cuda" if "cuda" in args.device else "cpu"
+    device_type = get_device_type(args.device)
+
+    # MPS 上 F.scaled_dot_product_attention 性能极差（forward 慢 15x，backward 慢 100x+），
+    # 强制关闭 flash_attn，使用手动 attention 实现
+    if device_type == "mps" and lm_config.flash_attn:
+        lm_config.flash_attn = False
+        Logger('⚡ MPS: flash_attn disabled (SDPA is extremely slow on MPS, using manual attention)')
+
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+    if device_type == "cuda":
+        autocast_ctx = torch.cuda.amp.autocast(dtype=dtype)
+    elif device_type == "mps":
+        autocast_ctx = torch.autocast(device_type="mps", dtype=dtype)
+    else:
+        autocast_ctx = nullcontext()
 
     wandb = None
     if args.use_wandb and is_main_process():
@@ -477,7 +490,7 @@ if __name__ == "__main__":
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
-        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=(device_type == "cuda"), collate_fn=collate_fn)
         if skip > 0:
             Logger(f'Epoch [{epoch+1}/{args.epochs}]: skip {start_step} steps')
             rl_train_epoch(epoch, loader, len(loader) + skip, rollout_engine, ref_model, reward_model, start_step, wandb, use_sglang = (args.rollout_engine == "sglang"))

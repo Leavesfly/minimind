@@ -15,18 +15,58 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, get_default_device, get_device_type
 
 warnings.filterwarnings('ignore')
 
 
+def format_duration(seconds):
+    """将秒数格式化为可读的时间字符串"""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}min"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h{minutes:02d}m"
+
+
+def get_memory_usage(device_type):
+    """获取当前设备的内存使用信息"""
+    if device_type == "cuda":
+        allocated = torch.cuda.memory_allocated() / 1024 ** 3
+        reserved = torch.cuda.memory_reserved() / 1024 ** 3
+        return f"mem: {allocated:.1f}/{reserved:.1f}GB"
+    elif device_type == "mps":
+        allocated = torch.mps.current_allocated_memory() / 1024 ** 3
+        return f"mem: {allocated:.2f}GB"
+    return ""
+
+
+def make_progress_bar(current, total, bar_length=20):
+    """生成文本进度条"""
+    filled = int(bar_length * current / total)
+    bar = '█' * filled + '░' * (bar_length - filled)
+    percent = 100.0 * current / total
+    return f"|{bar}| {percent:.1f}%"
+
+
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    start_time = time.time()
+    epoch_start_time = time.time()
     last_step = start_step
+    log_start_time = time.time()
+    log_step_count = 0
+    running_loss_sum = torch.tensor(0.0, device=args.device)
+
+    # 预计算每 batch 的有效 token 数（固定序列长度下近似恒定）
+    tokens_per_batch = args.batch_size * args.max_seq_len
+
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
+        input_ids = input_ids.to(args.device, non_blocking=True)
+        labels = labels.to(args.device, non_blocking=True)
         last_step = step
+
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -34,28 +74,80 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         with autocast_ctx:
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+            scaled_loss = loss / args.accumulation_steps
 
-        scaler.scale(loss).backward()
+        if use_scaler:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
 
         if step % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-            scaler.step(optimizer)
-            scaler.update()
-
+            if use_scaler:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == iters:
-            spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
+        # 在 GPU 上累加 loss，避免每步 .item() 导致的 GPU→CPU 同步
+        running_loss_sum += loss.detach()
+        log_step_count += 1
+
+        is_log_step = (step % args.log_interval == 0 or step == iters)
+
+        if is_log_step:
+            # 只在日志步做一次 GPU→CPU 同步
+            now = time.time()
+            elapsed_since_log = now - log_start_time
+            elapsed_total = now - epoch_start_time
+            steps_done = step - start_step
+
+            avg_loss = (running_loss_sum / max(log_step_count, 1)).item()
+            current_loss = loss.item()
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+
+            log_tokens = log_step_count * tokens_per_batch
+            tokens_per_sec = log_tokens / max(elapsed_since_log, 1e-6)
+            avg_step_time = elapsed_total / max(steps_done, 1)
+            eta_seconds = avg_step_time * (iters - step)
+
+            global_step = epoch * iters + step
+            global_total = args.epochs * iters
+            progress_bar = make_progress_bar(global_step, global_total)
+
+            mem_info = get_memory_usage(device_type)
+
+            Logger(
+                f'{progress_bar} '
+                f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
+                f'loss: {current_loss:.4f} (avg: {avg_loss:.4f}) | '
+                f'logits: {current_logits_loss:.4f} aux: {current_aux_loss:.4f} | '
+                f'lr: {current_lr:.2e} | '
+                f'{tokens_per_sec:.0f} tok/s | '
+                f'{avg_step_time * 1000:.0f}ms/step | '
+                f'ETA: {format_duration(eta_seconds)} | '
+                f'{mem_info}'
+            )
+
+            if wandb:
+                wandb.log({
+                    "loss": current_loss,
+                    "avg_loss": avg_loss,
+                    "logits_loss": current_logits_loss,
+                    "aux_loss": current_aux_loss,
+                    "learning_rate": current_lr,
+                    "tokens_per_sec": tokens_per_sec,
+                    "epoch_eta_min": eta_seconds / 60,
+                })
+
+            log_start_time = now
+            log_step_count = 0
+            running_loss_sum.zero_()
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
@@ -68,16 +160,32 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
+            if device_type == "mps":
+                torch.mps.empty_cache()
 
-        del input_ids, labels, res, loss
+        del input_ids, labels, res, loss, scaled_loss
+
+    epoch_elapsed = time.time() - epoch_start_time
+    total_tokens = (last_step - start_step) * tokens_per_batch
+    avg_tokens_per_sec = total_tokens / max(epoch_elapsed, 1e-6)
+    Logger(
+        f'✅ Epoch {epoch + 1}/{args.epochs} complete | '
+        f'steps: {last_step - start_step} | '
+        f'time: {format_duration(epoch_elapsed)} | '
+        f'avg: {avg_tokens_per_sec:.0f} tok/s | '
+        f'tokens: {total_tokens:,}'
+    )
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        if use_scaler:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
@@ -86,18 +194,18 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
+    parser.add_argument("--device", type=str, default=get_default_device(), help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
+    parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
+    parser.add_argument("--data_path", type=str, default="../.dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
@@ -109,18 +217,44 @@ if __name__ == "__main__":
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
-    
-    # ========== 3. 设置混合精度 ==========
-    device_type = "cuda" if "cuda" in args.device else "cpu"
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
-    # ========== 4. 配wandb ==========
+
+    # ========== 3. 设置混合精度（针对设备类型自动适配） ==========
+    device_type = get_device_type(args.device)
+
+    # MPS 上 F.scaled_dot_product_attention 性能极差（forward 慢 15x，backward 慢 100x+），
+    # 强制关闭 flash_attn，使用手动 attention 实现
+    if device_type == "mps" and lm_config.flash_attn:
+        lm_config.flash_attn = False
+        Logger('⚡ MPS: flash_attn disabled (SDPA is extremely slow on MPS, using manual attention)')
+
+    if device_type == "mps":
+        # MPS 上 autocast + GradScaler 有巨大开销（实测慢 3x+），直接用 fp32 原生计算最快
+        Logger('⚡ MPS: autocast/scaler disabled (native fp32 is fastest on Apple Silicon)')
+        autocast_ctx = nullcontext()
+        os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+    elif device_type == "cuda":
+        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+        autocast_ctx = torch.cuda.amp.autocast(dtype=dtype)
+    else:
+        autocast_ctx = nullcontext()
+
+    # ========== 4. 打印训练环境摘要 ==========
+    Logger('=' * 60)
+    Logger(f'  MiniMind Pretraining')
+    Logger(f'  Device: {args.device} | dtype: {args.dtype}')
+    Logger(f'  Epochs: {args.epochs} | Batch: {args.batch_size} | Accum: {args.accumulation_steps}')
+    Logger(f'  Effective batch: {args.batch_size * args.accumulation_steps}')
+    Logger(f'  LR: {args.learning_rate} | Grad clip: {args.grad_clip}')
+    Logger(f'  Max seq len: {args.max_seq_len} | Workers: {args.num_workers}')
+    Logger(f'  Model: hidden={args.hidden_size}, layers={args.num_hidden_layers}, MoE={bool(args.use_moe)}')
+    Logger('=' * 60)
+
+    # ========== 5. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
@@ -128,43 +262,86 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
-    # ========== 5. 定义模型、数据、优化器 ==========
+
+    # ========== 6. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 统一内存架构：数据直接放 GPU 上，训练时零拷贝
+    dataset_device = args.device if device_type == "mps" else None
+    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len, device=dataset_device)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+
+    use_scaler = (device_type == "cuda" and args.dtype == "float16")
+    if device_type == "cuda":
+        scaler = torch.amp.GradScaler(device="cuda", enabled=use_scaler)
+    else:
+        scaler = torch.amp.GradScaler(enabled=False)
+
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    
-    # ========== 6. 从ckp恢复状态 ==========
+
+    Logger(f'Dataset size: {len(train_ds):,} samples')
+    total_steps_per_epoch = (len(train_ds) + args.batch_size - 1) // args.batch_size
+    total_tokens_estimate = len(train_ds) * args.max_seq_len * args.epochs
+    Logger(f'Steps/epoch: ~{total_steps_per_epoch:,} | Total tokens (est): ~{total_tokens_estimate:,}')
+
+    # ========== 7. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
-        scaler.load_state_dict(ckp_data['scaler'])
+        if use_scaler and 'scaler' in ckp_data:
+            scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-    
-    # ========== 7. 编译和分布式包装 ==========
+        Logger(f'Resumed from epoch {start_epoch}, step {start_step}')
+
+    # ========== 8. 编译和分布式包装 ==========
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
-    
-    # ========== 8. 开始训练 ==========
+
+    # ========== 9. DataLoader 性能参数（针对本机优化） ==========
+    # MPS 统一内存：数据已在 GPU 上，num_workers=0 避免跨进程拷贝 GPU tensor
+    # CUDA：保留 multi-worker + pin_memory 的标准优化
+    if device_type == "mps":
+        Logger(f'⚡ MPS unified memory: num_workers → 0 (data already on GPU, zero-copy)')
+        args.num_workers = 0
+    pin_memory = (device_type == "cuda")
+    use_persistent_workers = (args.num_workers > 0)
+    prefetch_factor = 2 if args.num_workers > 0 else None
+
+    # ========== 10. 开始训练 ==========
+    training_start_time = time.time()
+    Logger(f'\n🚀 Training started at {time.strftime("%Y-%m-%d %H:%M:%S")}')
+
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
-        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-        if skip > 0: 
+        loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=use_persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
-    
-    # ========== 9. 清理分布进程 ==========
-    if dist.is_initialized(): dist.destroy_process_group()
+
+    # ========== 11. 训练完成摘要 ==========
+    total_training_time = time.time() - training_start_time
+    Logger(f'\n🎉 Training complete! Total time: {format_duration(total_training_time)}')
+    Logger(f'   Finished at {time.strftime("%Y-%m-%d %H:%M:%S")}')
+
+    # ========== 12. 清理 ==========
+    if device_type == "mps":
+        torch.mps.empty_cache()
+    if dist.is_initialized():
+        dist.destroy_process_group()
