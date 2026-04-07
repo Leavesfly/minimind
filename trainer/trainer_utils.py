@@ -237,6 +237,11 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     Returns:
         (model, tokenizer) 元组
     """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isabs(tokenizer_path):
+        tokenizer_path = os.path.normpath(os.path.join(script_dir, tokenizer_path))
+    if not os.path.isabs(save_dir):
+        save_dir = os.path.normpath(os.path.join(script_dir, save_dir))
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniMindForCausalLM(lm_config)
 

@@ -9,6 +9,74 @@ from torch.utils.data import Dataset
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+def _pretrain_tokenize_and_pad(batch, tokenizer, max_length, bos_id, eos_id, pad_id):
+    """模块级函数：批量 tokenize + padding + label 生成，确保 datasets.map 多进程可序列化"""
+    batch_input_ids = []
+    batch_labels = []
+    for text in batch['text']:
+        tokens = tokenizer(
+            str(text),
+            add_special_tokens=False,
+            max_length=max_length - 2,
+            truncation=True
+        ).input_ids
+        tokens = [bos_id] + tokens + [eos_id]
+        padding_len = max_length - len(tokens)
+        input_ids = tokens + [pad_id] * padding_len
+        labels = [(-100 if token_id == pad_id else token_id) for token_id in input_ids]
+        batch_input_ids.append(input_ids)
+        batch_labels.append(labels)
+    return {'input_ids': batch_input_ids, 'labels': batch_labels}
+
+
+def _sft_generate_labels(input_ids, bos_marker, eos_marker, max_len):
+    """模块级函数：根据 bos/eos marker 生成 labels，非 assistant 区域标记为 -100"""
+    labels = [-100] * len(input_ids)
+    i = 0
+    while i < len(input_ids):
+        if input_ids[i:i + len(bos_marker)] == bos_marker:
+            start = i + len(bos_marker)
+            end = start
+            while end < len(input_ids):
+                if input_ids[end:end + len(eos_marker)] == eos_marker:
+                    break
+                end += 1
+            for j in range(start, min(end + len(eos_marker), max_len)):
+                labels[j] = input_ids[j]
+            i = end + len(eos_marker) if end < len(input_ids) else len(input_ids)
+        else:
+            i += 1
+    return labels
+
+
+def _sft_tokenize_batch(batch, tokenizer, max_length, bos_id, eos_id, pad_id):
+    """模块级函数：SFT 批量处理 chat 预处理 → template → tokenize → label 生成 → padding"""
+    batch_input_ids = []
+    batch_labels = []
+    for conversations in batch['conversations']:
+        conversations = pre_processing_chat(conversations)
+        # 构建 chat prompt
+        messages = []
+        tools = None
+        for message in conversations:
+            message = dict(message)
+            if message.get("role") == "system" and message.get("tools"):
+                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+            if message.get("tool_calls") and isinstance(message["tool_calls"], str):
+                message["tool_calls"] = json.loads(message["tool_calls"])
+            messages.append(message)
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, tools=tools
+        )
+        prompt = post_processing_chat(prompt)
+        input_ids = tokenizer(prompt).input_ids[:max_length]
+        input_ids += [pad_id] * (max_length - len(input_ids))
+        labels = _sft_generate_labels(input_ids, bos_id, eos_id, max_length)
+        batch_input_ids.append(input_ids)
+        batch_labels.append(labels)
+    return {'input_ids': batch_input_ids, 'labels': batch_labels}
+
+
 def pre_processing_chat(conversations, add_system_ratio=0.2):
     # tool use 数据完整保留不做处理
     if any(conv.get('tools') for conv in conversations): return conversations
@@ -94,40 +162,20 @@ class PretrainDataset(Dataset):
         print(f'Pre-tokenizing {len(raw_samples)} samples (storage: {storage_dtype}, workers: {num_proc})...',
               flush=True)
 
-        def tokenize_and_pad(batch):
-            """
-            批量 tokenize + padding + label 生成，供 datasets.map 多进程调用
-            
-            Args:
-                batch: 包含 'text' 字段的批次数据
-            
-            Returns:
-                包含 'input_ids' 和 'labels' 的字典
-            """
-            batch_input_ids = []
-            batch_labels = []
-            for text in batch['text']:
-                tokens = tokenizer(
-                    str(text),
-                    add_special_tokens=False,
-                    max_length=max_length - 2,
-                    truncation=True
-                ).input_ids
-                tokens = [bos_id] + tokens + [eos_id]
-                padding_len = max_length - len(tokens)
-                input_ids = tokens + [pad_id] * padding_len
-                labels = [(-100 if token_id == pad_id else token_id) for token_id in input_ids]
-                batch_input_ids.append(input_ids)
-                batch_labels.append(labels)
-            return {'input_ids': batch_input_ids, 'labels': batch_labels}
-
         tokenized = raw_samples.map(
-            tokenize_and_pad,
+            _pretrain_tokenize_and_pad,
             batched=True,
             batch_size=1000,
             num_proc=num_proc,
             remove_columns=raw_samples.column_names,
             desc='Tokenizing',
+            fn_kwargs={
+                'tokenizer': tokenizer,
+                'max_length': max_length,
+                'bos_id': bos_id,
+                'eos_id': eos_id,
+                'pad_id': pad_id,
+            },
         )
 
         # 转为 tensor（datasets 的 Arrow 格式可以零拷贝转换）
@@ -207,90 +255,20 @@ class SFTDataset(Dataset):
 
         print(f'Pre-tokenizing SFT {len(raw_samples)} samples (workers: {num_proc})...', flush=True)
 
-        def _create_chat_prompt(conversations, tok):
-            """
-            将 conversations 转为 chat prompt 文本
-            
-            Args:
-                conversations: 对话消息列表
-                tok: 分词器实例
-            
-            Returns:
-                应用 chat template 后的 prompt 文本
-            """
-            messages = []
-            tools = None
-            for message in conversations:
-                message = dict(message)
-                if message.get("role") == "system" and message.get("tools"):
-                    tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
-                if message.get("tool_calls") and isinstance(message["tool_calls"], str):
-                    message["tool_calls"] = json.loads(message["tool_calls"])
-                messages.append(message)
-            return tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False, tools=tools
-            )
-
-        def _generate_labels(input_ids, bos_marker, eos_marker, max_len):
-            """
-            根据 bos/eos marker 生成 labels，非 assistant 区域标记为 -100
-            
-            Args:
-                input_ids: 输入 token ids
-                bos_marker: assistant 开始标记（如 '<|assistant|>' 的 token ids）
-                eos_marker: assistant 结束标记（如 '<|end|>' 的 token ids）
-                max_len: 最大长度
-            
-            Returns:
-                labels 数组，assistant 区域为对应的 token id，其他区域为 -100
-            """
-            labels = [-100] * len(input_ids)
-            i = 0
-            while i < len(input_ids):
-                if input_ids[i:i + len(bos_marker)] == bos_marker:
-                    start = i + len(bos_marker)
-                    end = start
-                    while end < len(input_ids):
-                        if input_ids[end:end + len(eos_marker)] == eos_marker:
-                            break
-                        end += 1
-                    for j in range(start, min(end + len(eos_marker), max_len)):
-                        labels[j] = input_ids[j]
-                    i = end + len(eos_marker) if end < len(input_ids) else len(input_ids)
-                else:
-                    i += 1
-            return labels
-
-        def tokenize_sft_batch(batch):
-            """
-            批量处理：chat 预处理 → template → tokenize → label 生成 → padding
-            
-            Args:
-                batch: 包含 'conversations' 字段的批次数据
-            
-            Returns:
-                包含 'input_ids' 和 'labels' 的字典
-            """
-            batch_input_ids = []
-            batch_labels = []
-            for conversations in batch['conversations']:
-                conversations = pre_processing_chat(conversations)
-                prompt = _create_chat_prompt(conversations, tokenizer)
-                prompt = post_processing_chat(prompt)
-                input_ids = tokenizer(prompt).input_ids[:max_length]
-                input_ids += [pad_id] * (max_length - len(input_ids))
-                labels = _generate_labels(input_ids, bos_id, eos_id, max_length)
-                batch_input_ids.append(input_ids)
-                batch_labels.append(labels)
-            return {'input_ids': batch_input_ids, 'labels': batch_labels}
-
         tokenized = raw_samples.map(
-            tokenize_sft_batch,
+            _sft_tokenize_batch,
             batched=True,
             batch_size=1000,
             num_proc=num_proc,
             remove_columns=raw_samples.column_names,
             desc='Tokenizing SFT',
+            fn_kwargs={
+                'tokenizer': tokenizer,
+                'max_length': max_length,
+                'bos_id': bos_id,
+                'eos_id': eos_id,
+                'pad_id': pad_id,
+            },
         )
 
         tokenized.set_format('torch')

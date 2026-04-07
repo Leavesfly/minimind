@@ -9,6 +9,7 @@ MiniMind 预训练脚本
 - 梯度裁剪
 - 模型检查点保存和恢复
 - WandB 日志记录
+- TensorBoard 可视化
 - MPS/CUDA 设备优化
 """
 
@@ -93,7 +94,7 @@ def make_progress_bar(current, total, bar_length=20):
     return f"|{bar}| {percent:.1f}%"
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(epoch, loader, iters, start_step=0, wandb=None, tb_writer=None):
     """
     执行一个 epoch 的训练
     
@@ -121,7 +122,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     # 预计算每 batch 的有效 token 数（固定序列长度下近似恒定）
     tokens_per_batch = args.batch_size * args.max_seq_len
 
+    first_step_logged = False
+
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        if not first_step_logged:
+            Logger(f'📦 First batch loaded, starting forward pass (step {step})...')
+            first_step_logged = True
+
         input_ids = input_ids.to(args.device, non_blocking=True)
         labels = labels.to(args.device, non_blocking=True)
         last_step = step
@@ -155,7 +162,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         running_loss_sum += loss.detach()
         log_step_count += 1
 
-        is_log_step = (step % args.log_interval == 0 or step == iters)
+        is_log_step = (step % args.log_interval == 0 or step == iters or step == start_step + 1)
 
         if is_log_step:
             # 只在日志步做一次 GPU→CPU 同步
@@ -204,6 +211,16 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     "epoch_eta_min": eta_seconds / 60,
                 })
 
+            if tb_writer:
+                tb_writer.add_scalar('Loss/current', current_loss, global_step)
+                tb_writer.add_scalar('Loss/average', avg_loss, global_step)
+                tb_writer.add_scalar('Loss/logits', current_logits_loss, global_step)
+                tb_writer.add_scalar('Loss/aux', current_aux_loss, global_step)
+                tb_writer.add_scalar('Training/learning_rate', current_lr, global_step)
+                tb_writer.add_scalar('Training/tokens_per_sec', tokens_per_sec, global_step)
+                tb_writer.add_scalar('Training/ms_per_step', avg_step_time * 1000, global_step)
+                tb_writer.add_scalar('Training/eta_minutes', eta_seconds / 60, global_step)
+
             log_start_time = now
             log_step_count = 0
             running_loss_sum.zero_()
@@ -249,32 +266,44 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 
 if __name__ == "__main__":
+    # 项目根目录（trainer/ 的上一级），用于构建默认路径
+    _project_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
     # ========== 参数解析 ==========
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
+    parser.add_argument("--save_dir", type=str, default=os.path.join(_project_root, 'out'), help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default=get_default_device(), help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
+    parser.add_argument("--accumulation_steps", type=int, default=32, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
+    parser.add_argument("--log_interval", type=int, default=50, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
+    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--data_path", type=str, default="../.dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
+    parser.add_argument("--data_path", type=str, default=os.path.join(_project_root, '.dataset', 'pretrain_t2t_mini.jsonl'), help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
+    parser.add_argument("--use_tb", action="store_true", help="是否使用TensorBoard可视化")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1],
                         help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
+
+    # 将路径参数转为基于脚本目录的绝对路径，避免 cwd 差异和第三方库路径校验问题
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    for _attr in ('save_dir', 'data_path'):
+        _path = getattr(args, _attr)
+        if not os.path.isabs(_path):
+            _path = os.path.join(_script_dir, _path)
+        setattr(args, _attr, os.path.normpath(_path))
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
@@ -284,12 +313,22 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_moe=bool(args.use_moe))
+                               use_moe=bool(args.use_moe), num_key_value_heads=2)
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight,
                              save_dir='../checkpoints') if args.from_resume == 1 else None
 
-    # ========== 3. 设置混合精度（针对设备类型自动适配） ==========
+    # ========== 3. 设置混合精度 & CUDA 性能优化 ==========
     device_type = get_device_type(args.device)
+
+    if device_type == "cuda":
+        # TF32：在 Ampere+ GPU 上用 TF32 替代 FP32 做矩阵乘法和卷积，精度损失极小但速度提升显著
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # cuDNN benchmark：自动为当前输入尺寸选择最快的卷积算法（固定输入尺寸时效果最佳）
+        torch.backends.cudnn.benchmark = True
+        # 设置 CUDA 内存分配器为可扩展段模式，减少内存碎片
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        Logger('⚡ CUDA: TF32 + cuDNN benchmark + expandable_segments enabled')
 
     # MPS 上 F.scaled_dot_product_attention 性能极差（forward 慢 15x，backward 慢 100x+），
     # 强制关闭 flash_attn，使用手动 attention 实现
@@ -328,6 +367,15 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+
+    # ========== 5b. 配置 TensorBoard ==========
+    tb_writer = None
+    if args.use_tb and is_main_process():
+        from torch.utils.tensorboard import SummaryWriter
+        tb_log_dir = os.path.join(args.save_dir, 'tb_logs', time.strftime('%Y%m%d_%H%M%S'))
+        tb_writer = SummaryWriter(log_dir=tb_log_dir)
+        Logger(f'📊 TensorBoard enabled → {tb_log_dir}')
+        Logger(f'   Run: tensorboard --logdir {os.path.abspath(tb_log_dir)}')
 
     # ========== 6. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
@@ -398,9 +446,9 @@ if __name__ == "__main__":
         )
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb, tb_writer)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, len(loader), 0, wandb, tb_writer)
 
     # ========== 11. 训练完成摘要 ==========
     total_training_time = time.time() - training_start_time
@@ -408,6 +456,8 @@ if __name__ == "__main__":
     Logger(f'   Finished at {time.strftime("%Y-%m-%d %H:%M:%S")}')
 
     # ========== 12. 清理 ==========
+    if tb_writer:
+        tb_writer.close()
     if device_type == "mps":
         torch.mps.empty_cache()
     if dist.is_initialized():

@@ -217,20 +217,20 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='full_dist', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=6, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="初始学习率")
     parser.add_argument("--device", type=str, default=get_default_device(), help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
+    parser.add_argument("--accumulation_steps", type=int, default=16, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
     parser.add_argument("--max_seq_len", type=int, default=340, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument("--data_path", type=str, default="../.dataset/sft_t2t_mini.jsonl", help="训练数据路径")
-    parser.add_argument('--student_hidden_size', default=768, type=int, help="学生模型隐藏层维度")
+    parser.add_argument('--student_hidden_size', default=512, type=int, help="学生模型隐藏层维度")
     parser.add_argument('--student_num_layers', default=8, type=int, help="学生模型隐藏层数量")
-    parser.add_argument('--teacher_hidden_size', default=768, type=int, help="教师模型隐藏层维度")
+    parser.add_argument('--teacher_hidden_size', default=512, type=int, help="教师模型隐藏层维度")
     parser.add_argument('--teacher_num_layers', default=8, type=int, help="教师模型隐藏层数量")
     parser.add_argument('--student_use_moe', default=0, type=int, choices=[0, 1], help="学生模型是否使用MoE（0=否，1=是）")
     parser.add_argument('--teacher_use_moe', default=1, type=int, choices=[0, 1], help="教师模型是否使用MoE（0=否，1=是）")
@@ -254,9 +254,9 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config_student = MiniMindConfig(hidden_size=args.student_hidden_size, num_hidden_layers=args.student_num_layers,
-                                       use_moe=bool(args.student_use_moe))
+                                       use_moe=bool(args.student_use_moe), num_key_value_heads=2)
     lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers,
-                                       use_moe=bool(args.teacher_use_moe))
+                                       use_moe=bool(args.teacher_use_moe), num_key_value_heads=2)
     ckp_data = lm_checkpoint(lm_config_student, weight=args.save_weight,
                              save_dir='../checkpoints') if args.from_resume == 1 else None
 
