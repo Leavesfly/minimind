@@ -1,6 +1,28 @@
 import argparse
 import json
 import re
+# -*- coding: utf-8 -*-
+"""
+OpenAI 兼容 API 服务端
+==============================================
+本脚本实现了一个 OpenAI 兼容的 API 服务端，可以与 MiniMind 模型交互。
+
+主要功能：
+- 提供 /v1/chat/completions 接口
+- 支持流式和非流式输出
+- 支持思考模式（Thinking）
+- 支持工具调用（Tool Call）
+- 支持多轮对话
+- 兼容 OpenAI API 格式
+
+使用方法：
+```bash
+python scripts/serve_openai_api.py --load_from ../model --weight full_sft
+```
+
+作者：MiniMind Team
+"""
+
 import os
 import sys
 
@@ -48,6 +70,10 @@ def init_model(args):
 
 
 class ChatRequest(BaseModel):
+    """聊天请求模型
+    
+    兼容 OpenAI API 的请求格式
+    """
     model: str
     messages: list
     temperature: float = 0.7
@@ -59,7 +85,11 @@ class ChatRequest(BaseModel):
     chat_template_kwargs: dict = None
     
     def get_open_thinking(self) -> bool:
-        """兼容多种方式开启 thinking"""
+        """兼容多种方式开启 thinking
+        
+        Returns:
+            是否开启思考模式
+        """
         if self.open_thinking:
             return True
         if self.chat_template_kwargs:
@@ -69,12 +99,22 @@ class ChatRequest(BaseModel):
 
 
 class CustomStreamer(TextStreamer):
+    """自定义流式输出器
+    
+    将模型生成的 token 实时推送到队列中
+    """
     def __init__(self, tokenizer, queue):
         super().__init__(tokenizer, skip_prompt=True, skip_special_tokens=True)
         self.queue = queue
         self.tokenizer = tokenizer
 
     def on_finalized_text(self, text: str, stream_end: bool = False):
+        """当文本完成时调用
+        
+        Args:
+            text: 生成的文本
+            stream_end: 是否结束流式输出
+        """
         self.queue.put(text)
         if stream_end:
             self.queue.put(None)

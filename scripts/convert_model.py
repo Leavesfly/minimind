@@ -1,3 +1,24 @@
+# -*- coding: utf-8 -*-
+"""
+模型格式转换工具
+==============================================
+本脚本提供了多种模型格式之间的转换功能，方便模型的部署和共享。
+
+主要功能：
+- PyTorch 权重 → Transformers 格式（MiniMind 原生）
+- PyTorch 权重 → Transformers 格式（Qwen3 兼容）
+- Transformers 格式 → PyTorch 权重
+- LoRA 权重合并到基座模型
+- Jinja 模板与 JSON 格式互转
+
+支持的场景：
+- 模型导出到 Hugging Face Hub
+- 与其他生态工具的兼容
+- LoRA 微调后的模型部署
+
+作者：MiniMind Team
+"""
+
 import os
 import sys
 import json
@@ -14,6 +35,13 @@ from model.model_lora import apply_lora, merge_lora
 warnings.filterwarnings('ignore', category=UserWarning)
 
 def convert_torch2transformers_minimind(torch_path, transformers_path, dtype=torch.float16):
+    """将 PyTorch 权重转换为 Transformers MiniMind 格式
+    
+    Args:
+        torch_path: PyTorch 权重文件路径
+        transformers_path: 输出的 Transformers 格式目录
+        dtype: 权重数据类型
+    """
     MiniMindConfig.register_for_auto_class()
     MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")
     lm_model = MiniMindForCausalLM(lm_config)
@@ -38,6 +66,15 @@ def convert_torch2transformers_minimind(torch_path, transformers_path, dtype=tor
 
 # QwenForCausalLM/LlamaForCausalLM结构兼容生态
 def convert_torch2transformers(torch_path, transformers_path, dtype=torch.float16):
+    """将 PyTorch 权重转换为 Transformers Qwen3 兼容格式
+    
+    转换为 Qwen3 格式可以更好地兼容 Hugging Face 生态系统
+    
+    Args:
+        torch_path: PyTorch 权重文件路径
+        transformers_path: 输出的 Transformers 格式目录
+        dtype: 权重数据类型
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     state_dict = torch.load(torch_path, map_location=device)
     common_config = {
@@ -97,12 +134,27 @@ def convert_torch2transformers(torch_path, transformers_path, dtype=torch.float1
 
 
 def convert_transformers2torch(transformers_path, torch_path):
+    """将 Transformers 格式转换为 PyTorch 权重
+    
+    Args:
+        transformers_path: Transformers 格式目录
+        torch_path: 输出的 PyTorch 权重文件路径
+    """
     model = AutoModelForCausalLM.from_pretrained(transformers_path, trust_remote_code=True)
     torch.save({k: v.cpu().half() for k, v in model.state_dict().items()}, torch_path)
     print(f"模型已保存为 PyTorch 格式: {torch_path}")
 
 
 def convert_merge_base_lora(base_torch_path, lora_path, merged_torch_path):
+    """合并基座模型和 LoRA 权重
+    
+    将 LoRA 微调的权重合并到基座模型中，生成完整的模型权重
+    
+    Args:
+        base_torch_path: 基座模型 PyTorch 权重路径
+        lora_path: LoRA 权重路径
+        merged_torch_path: 输出的合并后权重路径
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     lm_model = MiniMindForCausalLM(lm_config).to(device)
     state_dict = torch.load(base_torch_path, map_location=device)
@@ -113,12 +165,23 @@ def convert_merge_base_lora(base_torch_path, lora_path, merged_torch_path):
 
 
 def convert_jinja_to_json(jinja_path):
+    """将 Jinja 模板转换为 JSON 格式
+    
+    Args:
+        jinja_path: Jinja 模板文件路径
+    """
     with open(jinja_path, 'r') as f: template = f.read()
     escaped = json.dumps(template)
     print(f'"chat_template": {escaped}')
 
 
 def convert_json_to_jinja(json_file_path, output_path):
+    """将 JSON 格式转换为 Jinja 模板
+    
+    Args:
+        json_file_path: JSON 配置文件路径
+        output_path: 输出的 Jinja 模板文件路径
+    """
     with open(json_file_path, 'r') as f: config = json.load(f)
     template = config['chat_template']
     with open(output_path, 'w') as f: f.write(template)

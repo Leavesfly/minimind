@@ -1,7 +1,8 @@
 # 注：不建议再重复训练tokenizer（“词典”），MiniMind已自带，此脚本仅供学习和参考。基于不同词典训练的模型将导致输出完全不统一，降低社区的模型复用性
 # Note: It is not recommended to re-train the tokenizer. MiniMind already includes one. This script is for learning and reference only. Training models with different tokenizers will lead to inconsistent outputs and reduce model reusability in the community.
-import os
 import json
+import os
+
 from tokenizers import decoders, models, pre_tokenizers, trainers, Tokenizer
 
 DATA_PATH = '../.dataset/sft_t2t_mini.jsonl'
@@ -9,10 +10,19 @@ TOKENIZER_DIR = '../model_learn_tokenizer/'
 VOCAB_SIZE = 6400
 SPECIAL_TOKENS_NUM = 36
 
+
 def get_texts(data_path):
+    """从数据文件中读取文本内容
+    
+    Args:
+        data_path: 数据文件路径（JSONL 格式）
+    
+    Yields:
+        文本内容字符串
+    """
     with open(data_path, 'r', encoding='utf-8', errors='ignore') as f:
         for i, line in enumerate(f):
-            if i >= 10000: break # 选10000行测试
+            if i >= 10000: break  # 选10000行测试
             try:
                 data = json.loads(line)
                 contents = [item.get('content') for item in data.get('conversations', []) if item.get('content')]
@@ -21,24 +31,36 @@ def get_texts(data_path):
             except json.JSONDecodeError:
                 continue
 
+
 def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPECIAL_TOKENS_NUM):
+    """训练自定义分词器
+    
+    从语料文件中训练 BPE 分词器，并保存到指定目录
+    
+    Args:
+        data_path: 训练语料文件路径
+        tokenizer_dir: 分词器保存目录
+        vocab_size: 词表大小
+        special_tokens_num: 特殊 token 数量
+    """
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    
+
     special_tokens_list = [
-        "<|endoftext|>", "<|im_start|>", "<|im_end|>", 
-        "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>", 
-        "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", 
-        "<|audio_start|>", "<|audio_end|>", "<|audio_pad|>", "<tts_pad>", "<tts_text_bos>", "<tts_text_eod>", "<tts_text_bos_single>"
+        "<|endoftext|>", "<|im_start|>", "<|im_end|>",
+        "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>",
+        "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+        "<|audio_start|>", "<|audio_end|>", "<|audio_pad|>", "<tts_pad>", "<tts_text_bos>", "<tts_text_eod>",
+        "<tts_text_bos_single>"
     ]
-    
+
     additional_tokens_list = [
         "<tool_call>", "</tool_call>",
         "<tool_response>", "</tool_response>",
         "<think>", "</think>"
     ]
     num_buffer = special_tokens_num - len(special_tokens_list + additional_tokens_list)
-    buffer_tokens = [f"<|buffer{i}|>" for i in range(1, num_buffer + 1)] # 预留一定数量的token位置
+    buffer_tokens = [f"<|buffer{i}|>" for i in range(1, num_buffer + 1)]  # 预留一定数量的token位置
     all_special_tokens = special_tokens_list + additional_tokens_list + buffer_tokens
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
@@ -62,7 +84,7 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
             token_info['special'] = False
     with open(tokenizer_json_path, 'w', encoding='utf-8') as f:
         json.dump(tokenizer_data, f, ensure_ascii=False, indent=2)
-    
+
     added_tokens_decoder = {}
     for i, token in enumerate(all_special_tokens):
         idx = tokenizer.token_to_id(token)
@@ -105,7 +127,19 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         json.dump(config, f, ensure_ascii=False, indent=4)
     print("Tokenizer training completed.")
 
+
 def eval_tokenizer(tokenizer_dir):
+    """评估分词器性能
+    
+    评估指标包括：
+    - 聊天模板应用效果
+    - 编码解码一致性
+    - 压缩率（字符数/token数）
+    - 流式解码正确性
+    
+    Args:
+        tokenizer_dir: 分词器目录路径
+    """
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     messages = [
@@ -119,15 +153,15 @@ def eval_tokenizer(tokenizer_dir):
         messages,
         tokenize=False
     )
-    print('-'*100)
+    print('-' * 100)
     print(new_prompt)
-    print('-'*100)
+    print('-' * 100)
     print('tokenizer词表长度：', len(tokenizer))
     model_inputs = tokenizer(new_prompt)
     print('encoder长度：', len(model_inputs['input_ids']))
     response = tokenizer.decode(model_inputs['input_ids'], skip_special_tokens=False)
     print('decoder一致性：', response == new_prompt, "\n")
-    print('-'*100)
+    print('-' * 100)
     print('压缩率测试（Chars/Tokens）：')
     test_texts = [
         # 中文样本 (约200字)
@@ -139,7 +173,7 @@ def eval_tokenizer(tokenizer_dir):
         # 混合样本
         "Python 是一种高级编程语言，以其简洁的语法和强大的生态系统而闻名。It is widely used in data science, machine learning, and web development. 开发者可以利用 NumPy, Pandas, and PyTorch 等库快速构建复杂的应用。学习 Python 的过程非常愉快，因为它的代码读起来就像英语一样。Whether you are a beginner or an expert, Python offers something for everyone.",
     ]
-    
+
     total_compression = 0
     for i, text in enumerate(test_texts):
         encoded = tokenizer.encode(text)
@@ -147,10 +181,10 @@ def eval_tokenizer(tokenizer_dir):
         char_count = len(text)
         compression_ratio = char_count / token_count
         total_compression += compression_ratio
-        print(f"样本 {i+1} | 字符数: {char_count:4} | Tokens: {token_count:3} | 压缩率: {compression_ratio:.2f}")
-    
+        print(f"样本 {i + 1} | 字符数: {char_count:4} | Tokens: {token_count:3} | 压缩率: {compression_ratio:.2f}")
+
     print(f"平均压缩率: {total_compression / len(test_texts):.2f}")
-    print('-'*100)
+    print('-' * 100)
     print('流式解码（字节缓冲）测试：')
     input_ids = model_inputs['input_ids']
     token_cache = []
@@ -159,9 +193,11 @@ def eval_tokenizer(tokenizer_dir):
         current_decode = tokenizer.decode(token_cache)
         if current_decode and '\ufffd' not in current_decode:
             display_ids = token_cache[0] if len(token_cache) == 1 else token_cache
-            raw_tokens = [tokenizer.convert_ids_to_tokens(int(t)) for t in (token_cache if isinstance(token_cache, list) else [token_cache])]
+            raw_tokens = [tokenizer.convert_ids_to_tokens(int(t)) for t in
+                          (token_cache if isinstance(token_cache, list) else [token_cache])]
             print(f'Token ID: {str(display_ids):15} -> Raw: {str(raw_tokens):20} -> Decode Str: {current_decode}')
             token_cache = []
+
 
 if __name__ == '__main__':
     train_tokenizer(DATA_PATH, TOKENIZER_DIR, VOCAB_SIZE)

@@ -1,3 +1,17 @@
+# -*- coding: utf-8 -*-
+"""
+MiniMind 预训练脚本
+
+本脚本用于 MiniMind 模型的预训练阶段，支持：
+- 分布式训练（DDP）
+- 混合精度训练（bfloat16/float16）
+- 梯度累积
+- 梯度裁剪
+- 模型检查点保存和恢复
+- WandB 日志记录
+- MPS/CUDA 设备优化
+"""
+
 import os
 import sys
 
@@ -10,18 +24,27 @@ import warnings
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
-from torch import optim, nn
+from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, get_default_device, get_device_type
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, \
+    init_model, SkipBatchSampler, get_default_device, get_device_type
 
 warnings.filterwarnings('ignore')
 
 
 def format_duration(seconds):
-    """将秒数格式化为可读的时间字符串"""
+    """
+    将秒数格式化为可读的时间字符串
+    
+    Args:
+        seconds: 秒数
+        
+    Returns:
+        格式化的时间字符串，如 "30s", "5.5min", "2h30m"
+    """
     if seconds < 60:
         return f"{seconds:.0f}s"
     elif seconds < 3600:
@@ -33,7 +56,15 @@ def format_duration(seconds):
 
 
 def get_memory_usage(device_type):
-    """获取当前设备的内存使用信息"""
+    """
+    获取当前设备的内存使用信息
+    
+    Args:
+        device_type: 设备类型，支持 "cuda" 或 "mps"
+        
+    Returns:
+        内存使用信息字符串，如 "mem: 12.3/15.0GB"
+    """
     if device_type == "cuda":
         allocated = torch.cuda.memory_allocated() / 1024 ** 3
         reserved = torch.cuda.memory_reserved() / 1024 ** 3
@@ -45,7 +76,17 @@ def get_memory_usage(device_type):
 
 
 def make_progress_bar(current, total, bar_length=20):
-    """生成文本进度条"""
+    """
+    生成文本进度条
+    
+    Args:
+        current: 当前进度
+        total: 总进度
+        bar_length: 进度条长度（字符数）
+        
+    Returns:
+        进度条字符串，如 "|████████░░░░░░░░| 40.0%"
+    """
     filled = int(bar_length * current / total)
     bar = '█' * filled + '░' * (bar_length - filled)
     percent = 100.0 * current / total
@@ -53,6 +94,24 @@ def make_progress_bar(current, total, bar_length=20):
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    """
+    执行一个 epoch 的训练
+    
+    训练循环包含以下关键步骤：
+    1. 前向传播计算 loss
+    2. 反向传播计算梯度
+    3. 梯度累积（accumulation_steps）
+    4. 梯度裁剪
+    5. 优化器更新
+    6. 定期记录日志和保存模型
+    
+    Args:
+        epoch: 当前 epoch 索引
+        loader: 数据加载器
+        iters: 本 epoch 总步数
+        start_step: 起始 step（用于恢复训练）
+        wandb: WandB 日志记录器（可选）
+    """
     epoch_start_time = time.time()
     last_step = start_step
     log_start_time = time.time()
@@ -157,7 +216,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler,
+                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
             if device_type == "mps":
@@ -187,7 +247,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+
 if __name__ == "__main__":
+    # ========== 参数解析 ==========
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
@@ -210,7 +272,8 @@ if __name__ == "__main__":
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
-    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1],
+                        help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -220,8 +283,10 @@ if __name__ == "__main__":
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
+                               use_moe=bool(args.use_moe))
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight,
+                             save_dir='../checkpoints') if args.from_resume == 1 else None
 
     # ========== 3. 设置混合精度（针对设备类型自动适配） ==========
     device_type = get_device_type(args.device)
@@ -258,6 +323,7 @@ if __name__ == "__main__":
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
+
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
@@ -318,7 +384,8 @@ if __name__ == "__main__":
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(42 + epoch);
+        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(

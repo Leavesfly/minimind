@@ -1,3 +1,37 @@
+# -*- coding: utf-8 -*-
+"""
+工具调用评测脚本
+==============================================
+本脚本实现了对模型工具调用能力的评测功能。
+
+主要功能：
+- 支持本地模型和 OpenAI 兼容 API 两种后端
+- 提供预定义测试用例和手动输入两种模式
+- 支持多轮工具调用的评测
+- 自动执行工具并验证结果
+
+评测工具：
+- calculate_math: 数学表达式计算
+- get_current_time: 获取当前时间
+- random_number: 生成随机数
+- text_length: 计算文本长度
+- unit_converter: 单位转换
+- get_current_weather: 获取天气信息
+- get_exchange_rate: 查询汇率
+- translate_text: 文本翻译
+
+使用方法：
+```bash
+# 本地模型评测
+python scripts/eval_toolcall.py --backend local --load_from ../model
+
+# API 评测
+python scripts/eval_toolcall.py --backend api --api_base_url http://localhost:11434/v1
+```
+
+作者：MiniMind Team
+"""
+
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -15,6 +49,8 @@ from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
+# ======== 工具定义 ========
+# 定义评测可用的工具列表
 TOOLS = [
     {"type": "function", "function": {"name": "calculate_math", "description": "计算数学表达式的结果，支持加减乘除、幂运算、开方等", "parameters": {"type": "object", "properties": {"expression": {"type": "string", "description": "数学表达式，如123+456、2**10、sqrt(144)"}}, "required": ["expression"]}}},
     {"type": "function", "function": {"name": "get_current_time", "description": "获取当前日期和时间，支持指定时区", "parameters": {"type": "object", "properties": {"timezone": {"type": "string", "description": "时区名称，如Asia/Shanghai、America/New_York", "default": "Asia/Shanghai"}}, "required": []}}},
@@ -26,6 +62,8 @@ TOOLS = [
     {"type": "function", "function": {"name": "translate_text", "description": "将文本翻译成目标语言", "parameters": {"type": "object", "properties": {"text": {"type": "string", "description": "要翻译的文本"}, "target_language": {"type": "string", "description": "目标语言，如english、chinese、japanese、french"}}, "required": ["text", "target_language"]}}},
 ]
 
+# ======== 模拟执行结果 ========
+# 定义各工具的模拟执行结果
 MOCK_RESULTS = {
     "calculate_math": lambda args: {"result": str(eval(str(args.get("expression", "0")).replace("^", "**").replace("×", "*").replace("÷", "/").replace("−", "-").replace("²", "**2").replace("³", "**3").replace("（", "(").replace("）", ")")))},
     "get_current_time": lambda args: {"datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "timezone": args.get("timezone", "Asia/Shanghai")},
@@ -37,11 +75,22 @@ MOCK_RESULTS = {
     "translate_text": lambda args: {"translated": "hello world"},
 }
 
+# 工具名称到工具定义的映射
 TOOL_MAP = {t["function"]["name"]: t for t in TOOLS}
 
 def get_tools(names):
+    """根据工具名称列表获取工具定义
+    
+    Args:
+        names: 工具名称列表
+    
+    Returns:
+        工具定义列表
+    """
     return [TOOL_MAP[n] for n in names]
 
+# ======== 测试用例 ========
+# 预定义的测试用例，用于自动化评测
 TEST_CASES = [
     {"prompt": "帮我算一下 256 乘以 37 等于多少", "tools": ["calculate_math", "get_current_time"]},
     {"prompt": "现在几点了？", "tools": ["get_current_time", "random_number"]},
@@ -55,6 +104,14 @@ TEST_CASES = [
 
 
 def init_model(args):
+    """初始化模型和分词器
+    
+    Args:
+        args: 命令行参数
+    
+    Returns:
+        tuple: (model, tokenizer)
+    """
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
         model = MiniMindForCausalLM(MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)))
@@ -68,6 +125,14 @@ def init_model(args):
 
 
 def parse_tool_calls(text):
+    """从文本中解析工具调用
+    
+    Args:
+        text: 包含工具调用的文本
+    
+    Returns:
+        工具调用列表
+    """
     matches = re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL)
     calls = []
     for m in matches:
@@ -79,6 +144,14 @@ def parse_tool_calls(text):
 
 
 def parse_tool_call_from_text(content):
+    """从内容中解析工具调用（OpenAI 格式）
+    
+    Args:
+        content: 响应内容
+    
+    Returns:
+        OpenAI 格式的工具调用列表
+    """
     pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
     matches = re.findall(pattern, content, re.DOTALL)
     if not matches:
@@ -97,6 +170,15 @@ def parse_tool_call_from_text(content):
 
 
 def execute_tool(call, arguments=None):
+    """执行工具调用
+    
+    Args:
+        call: 工具调用信息（字典或名称）
+        arguments: 工具参数（可选）
+    
+    Returns:
+        工具执行结果
+    """
     name = call.get("name", "") if isinstance(call, dict) else call
     try:
         raw_args = call.get("arguments", {}) if isinstance(call, dict) else arguments
@@ -113,6 +195,18 @@ def execute_tool(call, arguments=None):
 
 
 def generate(model, tokenizer, messages, tools, args):
+    """使用本地模型生成响应
+    
+    Args:
+        model: 语言模型
+        tokenizer: 分词器
+        messages: 对话消息列表
+        tools: 可用工具列表
+        args: 命令行参数
+    
+    Returns:
+        生成的响应文本
+    """
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools, open_thinking=False)
     inputs = tokenizer(input_text, return_tensors="pt", truncation=True).to(args.device)
@@ -131,6 +225,18 @@ def generate(model, tokenizer, messages, tools, args):
 
 
 def chat_api(client, messages, tools, args, stream=True):
+    """使用 OpenAI 兼容 API 生成响应
+    
+    Args:
+        client: OpenAI 客户端
+        messages: 对话消息列表
+        tools: 可用工具列表
+        args: 命令行参数
+        stream: 是否流式输出
+    
+    Returns:
+        tuple: (content, tool_calls)
+    """
     response = client.chat.completions.create(
         model=args.api_model, messages=messages, tools=tools,
         stream=stream, temperature=args.temperature,
@@ -175,6 +281,16 @@ def chat_api(client, messages, tools, args, stream=True):
 
 
 def run_case(prompt, tools, args, model=None, tokenizer=None, client=None):
+    """运行单个测试用例
+    
+    Args:
+        prompt: 用户提示
+        tools: 可用工具列表
+        args: 命令行参数
+        model: 本地模型（可选）
+        tokenizer: 分词器（可选）
+        client: OpenAI 客户端（可选）
+    """
     messages = [{"role": "user", "content": prompt}]
     while True:
         if args.backend == 'local':
@@ -200,6 +316,7 @@ def run_case(prompt, tools, args, model=None, tokenizer=None, client=None):
 
 
 def main():
+    """主函数：解析参数并运行评测"""
     parser = argparse.ArgumentParser(description="MiniMind ToolCall评测")
     parser.add_argument('--backend', default='local', choices=['local', 'api'], type=str, help="推理后端（local=本地模型，api=OpenAI兼容接口）")
     parser.add_argument('--load_from', default='../model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")

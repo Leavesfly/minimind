@@ -1,3 +1,25 @@
+# -*- coding: utf-8 -*-
+"""
+Streamlit Web 演示界面
+==============================================
+本脚本实现了一个基于 Streamlit 的 Web 界面，用于与 MiniMind 模型交互。
+
+主要功能：
+- 支持多轮对话
+- 支持思考模式（Thinking）的显示
+- 支持工具调用（Tool Call）
+- 支持多种模型切换
+- 支持中英文界面切换
+- 支持自定义生成参数
+
+使用方法：
+```bash
+streamlit run scripts/web_demo.py
+```
+
+作者：MiniMind Team
+"""
+
 import random
 import re
 import json
@@ -9,6 +31,7 @@ import numpy as np
 import streamlit as st
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
+# 设置 Streamlit 页面配置
 st.set_page_config(page_title="MiniMind", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -67,9 +90,11 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# 设备选择
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 多语言文本
+# ======== 多语言文本 ========
+# 定义中英文界面的文本映射
 LANG_TEXTS = {
     'zh': {
         'settings': '模型设定调整',
@@ -100,10 +125,19 @@ LANG_TEXTS = {
 }
 
 def get_text(key):
+    """根据当前语言获取文本
+    
+    Args:
+        key: 文本键
+    
+    Returns:
+        对应语言的文本
+    """
     lang = st.session_state.get('lang', 'en')
     return LANG_TEXTS.get(lang, {}).get(key, LANG_TEXTS['zh'].get(key, key))
 
-# 工具定义
+# ======== 工具定义 ========
+# 定义 Web 演示可用的工具列表
 TOOLS = [
     {"type": "function", "function": {"name": "calculate_math", "description": "计算数学表达式", "parameters": {"type": "object", "properties": {"expression": {"type": "string", "description": "数学表达式"}}, "required": ["expression"]}}},
     {"type": "function", "function": {"name": "get_current_time", "description": "获取当前时间", "parameters": {"type": "object", "properties": {"timezone": {"type": "string", "default": "Asia/Shanghai"}}, "required": []}}},
@@ -115,6 +149,7 @@ TOOLS = [
     {"type": "function", "function": {"name": "translate_text", "description": "翻译文本", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "target_lang": {"type": "string"}}, "required": ["text", "target_lang"]}}},
 ]
 
+# 工具简称映射（用于界面显示）
 TOOL_SHORT_NAMES = {
     'calculate_math': '数学', 'get_current_time': '时间', 'random_number': '随机',
     'text_length': '字数', 'unit_converter': '单位', 'get_current_weather': '天气',
@@ -122,6 +157,15 @@ TOOL_SHORT_NAMES = {
 }
 
 def execute_tool(tool_name, args):
+    """执行工具调用（模拟执行）
+    
+    Args:
+        tool_name: 工具名称
+        args: 工具参数
+    
+    Returns:
+        工具执行结果
+    """
     import datetime
     try:
         if tool_name == 'calculate_math':
@@ -147,6 +191,17 @@ def execute_tool(tool_name, args):
 
 
 def process_assistant_content(content, is_streaming=False):
+    """处理助手生成的内容
+    
+    格式化显示工具调用、思考内容等
+    
+    Args:
+        content: 生成的内容
+        is_streaming: 是否为流式输出
+    
+    Returns:
+        格式化后的 HTML 内容
+    """
     # 处理tool_call标签，格式化显示
     if '<tool_call>' in content:
         def format_tool_call(match):
@@ -197,6 +252,14 @@ def process_assistant_content(content, is_streaming=False):
 
 @st.cache_resource
 def load_model_tokenizer(model_path):
+    """加载模型和分词器（使用缓存）
+    
+    Args:
+        model_path: 模型路径
+    
+    Returns:
+        tuple: (model, tokenizer)
+    """
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True
@@ -231,6 +294,11 @@ def init_chat_messages():
     return st.session_state.messages
 
 def regenerate_answer(index):
+    """重新生成答案
+    
+    Args:
+        index: 消息索引
+    """
     st.session_state.messages.pop()
     st.session_state.chat_messages.pop()
     st.rerun()
