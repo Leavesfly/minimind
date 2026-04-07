@@ -41,36 +41,6 @@
 
 > 注：本项目基于 Apache 2.0 协议开源，完全免费；“2小时” 基于 NVIDIA 3090 硬件设备（单卡）预估，“3块钱” 指 GPU 服务器租用成本，具体规格详情见下文。
 
----
-
-<div align="center">
-
-![minimind-3](./images/minimind-3.gif)
-
-[🔗 在线体验](https://www.modelscope.cn/studios/gongjy/MiniMind) | [🔗 视频介绍](https://www.bilibili.com/video/BV12dHPeqE72)
-
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center">
-        <a href="https://huggingface.co/collections/jingyaogong/minimind" style="text-decoration: none;">
-          <img src="./images/with_huggingface.png" alt="Hugging Face Logo" style="vertical-align: middle; width: auto; max-width: 100%;" />
-        </a>
-      </td>
-      <td align="center">
-        <a href="https://www.modelscope.cn/profile/gongjy" style="text-decoration: none;">
-          <img src="./images/with_modelscope.png" alt="ModelScope Logo" style="vertical-align: middle; width: auto; max-width: 100%;" />
-        </a>
-      </td>
-    </tr>
-  </table>
-</div>
-
-
-</div>
-
----
 
 # 📌 项目介绍
 
@@ -1594,6 +1564,17 @@ minimind模型本身训练数据集很小，且没有什么英文知识能力，
 ![benchmark_radar](./images/benchmark_radar.jpg)
 
 # 📌 其他
+
+### 1. 安装 tensorboard
+pip install tensorboard
+
+### 2. 启动训练（加 --use_tb）
+python trainer/train_pretrain.py --use_tb
+
+### 3. 另开一个终端，启动 TensorBoard 面板
+tensorboard --logdir ./out/tb_logs
+
+### 4. 浏览器打开 http://localhost:6006 即可看到实时曲线 
 
 ## 🔧 模型转换
 
