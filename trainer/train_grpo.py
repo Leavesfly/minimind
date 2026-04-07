@@ -179,8 +179,8 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         completion_mask = (
-                    torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(
-                1)).int()  # [B*num_gen, R]
+                torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(
+            1)).int()  # [B*num_gen, R]
 
         # 4. 计算 KL 散度
         kl_div = ref_per_token_logps - per_token_logps
@@ -217,7 +217,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             avg_reward_val = rewards.mean().item()
             avg_len_val = completion_mask.sum(dim=1).float().mean().item()
             kl_ref_val = ((
-                                      ref_per_token_logps - per_token_logps) * completion_mask).sum().item() / completion_mask.sum().item()
+                                  ref_per_token_logps - per_token_logps) * completion_mask).sum().item() / completion_mask.sum().item()
             advantages_mean_val = advantages.mean().item()
             advantages_std_val = advantages.std().item()
             current_lr = optimizer.param_groups[0]['lr']

@@ -23,7 +23,8 @@ LoRA 是一种参数高效微调方法，通过冻结预训练模型权重，并
 """
 
 import torch
-from torch import optim, nn
+from torch import nn
+
 
 # 定义Lora网络结构
 class LoRA(nn.Module):
@@ -51,6 +52,7 @@ class LoRA(nn.Module):
         out_features (int): 输出特征维度
         rank (int): 低秩分解的秩，控制可训练参数量和表达能力
     """
+
     def __init__(self, in_features, out_features, rank):
         super().__init__()
         self.rank = rank  # LoRA的秩（rank），控制低秩矩阵的大小
@@ -63,6 +65,7 @@ class LoRA(nn.Module):
 
     def forward(self, x):
         return self.B(self.A(x))
+
 
 def apply_lora(model, rank=16):
     """
@@ -97,6 +100,7 @@ def apply_lora(model, rank=16):
 
             module.forward = forward_with_lora
 
+
 def load_lora(model, path):
     """
     从指定路径加载 LoRA 权重到模型
@@ -121,6 +125,7 @@ def load_lora(model, path):
         if hasattr(module, 'lora'):
             lora_state = {k.replace(f'{name}.lora.', ''): v for k, v in state_dict.items() if f'{name}.lora.' in k}
             module.lora.load_state_dict(lora_state)
+
 
 def save_lora(model, path):
     """
@@ -147,6 +152,7 @@ def save_lora(model, path):
             lora_state = {f'{clean_name}.lora.{k}': v.cpu().half() for k, v in module.lora.state_dict().items()}
             state_dict.update(lora_state)
     torch.save(state_dict, path)
+
 
 def merge_lora(model, lora_path, save_path):
     """

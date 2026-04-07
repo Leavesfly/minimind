@@ -267,7 +267,7 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
                 clipfrac = ((((ratio - 1.0).abs() > args.clip_epsilon).float() * resp_policy_mask[inds]).sum()
                             / resp_policy_mask[inds].sum().clamp(min=1))
                 kl_ref_penalty = ((torch.exp(ref_resp_logp[inds] - mb_resp_logp) - (
-                            ref_resp_logp[inds] - mb_resp_logp) - 1.0)
+                        ref_resp_logp[inds] - mb_resp_logp) - 1.0)
                                   * resp_policy_mask[inds]).sum() / resp_policy_mask[inds].sum().clamp(min=1)
                 policy_loss = ((torch.max(-advantages[inds] * ratio,
                                           -advantages[inds] * torch.clamp(ratio, 1.0 - args.clip_epsilon,
