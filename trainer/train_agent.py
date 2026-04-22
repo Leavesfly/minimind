@@ -157,24 +157,26 @@ def parse_tool_calls(text):
     for m in re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL):
         try:
             calls.append(json.loads(m.strip()))
-        except:
+        except Exception:
             pass
     return calls
 
 
 def execute_tool(name, args):
+    """执行指定名称的 mock 工具，带 1 秒超时保护；失败/超时返回 None。"""
     fn = MOCK_RESULTS.get(name)
-    if not fn: return None
+    if not fn:
+        return None
     try:
         signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
         signal.alarm(1)
         return fn(args)
-    except:
+    except Exception:
         return None
     finally:
         try:
             signal.alarm(0)
-        except:
+        except Exception:
             pass
 
 
@@ -249,7 +251,7 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
             if isinstance(raw, str):
                 try:
                     raw = json.loads(raw)
-                except:
+                except Exception:
                     raw = {}
             result = execute_tool(name, raw)
             result_str = (json.dumps(result, ensure_ascii=False) if result else '{"error": "tool not found"}')[
@@ -397,7 +399,7 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
                 if isinstance(raw, str):
                     try:
                         raw = json.loads(raw)
-                    except:
+                    except Exception:
                         raw = {}
                 check = CHECK_ARGS.get(name)
                 valid_call_count += int(bool(name in valid_names and check and check(raw)))
@@ -628,7 +630,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     Logger(f'Training device: {args.device}')
 
@@ -712,11 +715,13 @@ if __name__ == "__main__":
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
-    if is_main_process(): rollout_engine.update_policy(model)
+    if is_main_process():
+        rollout_engine.update_policy(model)
 
     for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch);
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        setup_seed(42 + epoch)
         indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
@@ -730,4 +735,5 @@ if __name__ == "__main__":
             rl_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb,
                            use_sglang=(args.rollout_engine == "sglang"))
 
-    if dist.is_initialized(): dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()

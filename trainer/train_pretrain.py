@@ -309,7 +309,8 @@ if __name__ == "__main__":
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
@@ -434,8 +435,9 @@ if __name__ == "__main__":
     Logger(f'\n🚀 Training started at {time.strftime("%Y-%m-%d %H:%M:%S")}')
 
     for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch);
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        setup_seed(42 + epoch)
         indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)

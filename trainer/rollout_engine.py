@@ -253,7 +253,8 @@ class SGLangRolloutEngine(RolloutEngine):
             json={"model_path": abs_path},
             timeout=self.timeout
         )
-        if resp.status_code != 200: print(f"[SGLANG WARNING] update_weights 失败: {resp.status_code}, {resp.text}")
+        if resp.status_code != 200:
+            print(f"[SGLANG WARNING] update_weights 失败: {resp.status_code}, {resp.text}")
         return resp.status_code == 200
 
     def flush_cache(self) -> bool:
@@ -264,7 +265,7 @@ class SGLangRolloutEngine(RolloutEngine):
         try:
             resp = self.http.get(f"{self.base_url}/health", timeout=5)
             return resp.status_code == 200
-        except:
+        except Exception:
             return False
 
 
