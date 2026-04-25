@@ -25,12 +25,12 @@ import warnings
 import torch
 import torch.distributed as dist
 from torch import optim
-from torch.utils.data import DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
 
 from dataset.lm_dataset import SFTDataset
 from model.model_minimind import MiniMindConfig
 from trainer.trainer_utils import (
-    Logger, build_train_dataloader, get_default_device, get_device_type, get_lr,
+    Logger, SkipBatchSampler, build_train_dataloader, get_default_device, get_device_type, get_lr,
     init_distributed_mode, init_model, is_main_process, lm_checkpoint,
     restore_training_state, save_checkpoint, setup_precision_context, setup_seed,
     setup_wandb, wrap_model_for_training,
