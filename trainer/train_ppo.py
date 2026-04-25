@@ -32,22 +32,23 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import RLAIFDataset
+from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from trainer.reward_utils import compute_repetition_penalty
+from trainer.rollout_engine import compute_per_token_logps, create_rollout_engine
 from trainer.trainer_utils import (
-    Logger, is_main_process, lm_checkpoint, init_distributed_mode,
-    setup_seed, SkipBatchSampler, init_model, LMForRewardModel,
-    get_default_device, get_device_type
+    LMForRewardModel, Logger, SkipBatchSampler, build_train_dataloader,
+    get_default_device, get_device_type, init_distributed_mode, init_model,
+    is_main_process, lm_checkpoint, restore_training_state, save_checkpoint,
+    setup_precision_context, setup_seed, setup_wandb, wrap_model_for_training,
 )
-from trainer.rollout_engine import create_rollout_engine
 
 warnings.filterwarnings('ignore')
 
 
-def rep_penalty(text, n=3, cap=0.5):
-    toks = re.findall(r"\w+|[^\w\s]", text.lower())
-    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
-    return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
+# n-gram 重复惩罚已统一抽取至 trainer.reward_utils.compute_repetition_penalty，
+# 此处保留同名别名以便保持原 API 兼容
+rep_penalty = compute_repetition_penalty
 
 
 # Critic 模型：继承自 CausalLM，将 lm_head 替换为 value_head，输出每个 token 的价值估计 V(s)
@@ -432,32 +433,12 @@ if __name__ == "__main__":
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight,
                              save_dir='../checkpoints') if args.from_resume == 1 else None
 
-    # ========== 3. 设置混合精度 ==========
+    # ========== 3. 设置混合精度（统一工具，自动处理 cuda/mps/cpu 差异） ==========
     device_type = get_device_type(args.device)
+    autocast_ctx, _scaler_unused, _ = setup_precision_context(device_type, args.dtype, lm_config)
 
-    # MPS 上 F.scaled_dot_product_attention 性能极差（forward 慢 15x，backward 慢 100x+），
-    # 强制关闭 flash_attn，使用手动 attention 实现
-    if device_type == "mps" and lm_config.flash_attn:
-        lm_config.flash_attn = False
-        Logger('⚡ MPS: flash_attn disabled (SDPA is extremely slow on MPS, using manual attention)')
-
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    if device_type == "cuda":
-        autocast_ctx = torch.cuda.amp.autocast(dtype=dtype)
-    elif device_type == "mps":
-        autocast_ctx = torch.autocast(device_type="mps", dtype=dtype)
-    else:
-        autocast_ctx = nullcontext()
-
-    # ========== 4. 配wandb ==========
-    wandb = None
-    if args.use_wandb and is_main_process():
-        import swanlab as wandb
-
-        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
-        resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-PPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+    # ========== 4. 配 wandb（统一工具，自动支持断点续训） ==========
+    wandb = setup_wandb(args, ckp_data, run_name_prefix="MiniMind-PPO")
 
     # ========== 5. 初始化模型和数据 ==========
     base_weight = args.from_weight
@@ -508,11 +489,14 @@ if __name__ == "__main__":
         start_step = ckp_data.get('step', 0)
 
     # ========== 7. 编译和分布式包装 ==========
+    # NOTE: PPO 同时需要包装 actor 和 critic 双模型，且 actor 编译后要再次注入 rollout_engine，
+    # 这种"双模型 + 注入"的耦合无法通过通用 wrap_model_for_training 表达，因此保留显式实现。
     if args.use_compile == 1:
         actor_model = torch.compile(actor_model)
         Logger('torch.compile enabled')
         rollout_engine.update_policy(actor_model)
     if dist.is_initialized():
+        # MiniMind 旋转位置编码 buffer 不需要 DDP 同步
         actor_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         critic_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank])

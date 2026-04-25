@@ -21,14 +21,18 @@ import sys
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import random
 import math
+import random
+import re
+from contextlib import nullcontext
+
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import Sampler
-from transformers import AutoTokenizer, AutoModel
+from torch.utils.data import DataLoader, Sampler
+from transformers import AutoModel, AutoTokenizer
+
 from model.model_minimind import MiniMindForCausalLM
 
 
@@ -364,3 +368,334 @@ class LMForRewardModel:
         ]
         score = self.model.get_score(self.tokenizer, eval_messages)
         return max(min(score, 3.0), -3.0)
+
+
+# =====================================================================================
+# 通用训练样板函数：抽取自各 train_*.py 中的重复模式
+# 这些函数封装了所有训练脚本共享的初始化、配置、保存、恢复逻辑，
+# 让具体的训练脚本只需关注算法本身（损失计算、训练循环）。
+# =====================================================================================
+
+def setup_precision_context(device_type, dtype_str, lm_config=None, *, disable_amp_on_mps=False):
+    """构造混合精度训练所需的 autocast 上下文与 GradScaler。
+
+    本函数统一处理三类设备的差异：
+    - CUDA：使用 ``torch.cuda.amp.autocast``，仅当 dtype 为 float16 时启用 GradScaler。
+    - MPS（Apple Silicon）：可选关闭 amp（实测 autocast+scaler 比 fp32 慢 3 倍以上）。
+    - CPU：不启用混合精度。
+
+    同时，由于 MPS 上 ``F.scaled_dot_product_attention`` 性能极差
+    （forward 慢约 15x，backward 慢 100x+），会自动关闭 ``lm_config.flash_attn``。
+
+    Args:
+        device_type: 设备类型字符串，"cuda" / "mps" / "cpu"。
+        dtype_str: 混合精度数据类型字符串，"bfloat16" 或 "float16"。
+        lm_config: 模型配置对象，若提供且为 MPS 设备会强制关闭 ``flash_attn``。
+        disable_amp_on_mps: 是否在 MPS 上完全关闭 amp（推荐设为 True）。
+
+    Returns:
+        (autocast_ctx, scaler, use_scaler) 三元组：
+            - autocast_ctx: 用于 ``with`` 语句的混合精度上下文管理器。
+            - scaler: ``torch.amp.GradScaler`` 实例（始终返回，未启用时 ``enabled=False``）。
+            - use_scaler: 布尔值，标识 scaler 是否真正启用（仅 CUDA + float16 为 True）。
+    """
+    from contextlib import nullcontext
+
+    # MPS 上禁用 flash_attn，避免 SDPA 性能崩塌
+    if device_type == "mps" and lm_config is not None and getattr(lm_config, "flash_attn", False):
+        lm_config.flash_attn = False
+        Logger("⚡ MPS: flash_attn disabled (SDPA is extremely slow on MPS, using manual attention)")
+
+    dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float16
+
+    if device_type == "cuda":
+        autocast_ctx = torch.cuda.amp.autocast(dtype=dtype)
+        use_scaler = (dtype_str == "float16")
+        scaler = torch.amp.GradScaler(device="cuda", enabled=use_scaler)
+    elif device_type == "mps":
+        if disable_amp_on_mps:
+            Logger("⚡ MPS: autocast/scaler disabled (native fp32 is fastest on Apple Silicon)")
+            autocast_ctx = nullcontext()
+        else:
+            autocast_ctx = torch.autocast(device_type="mps", dtype=dtype)
+        scaler = torch.amp.GradScaler(enabled=False)
+        use_scaler = False
+    else:  # cpu
+        autocast_ctx = nullcontext()
+        scaler = torch.amp.GradScaler(enabled=False)
+        use_scaler = False
+
+    return autocast_ctx, scaler, use_scaler
+
+
+def setup_cuda_perf_options():
+    """为 CUDA 设备开启常用性能优化（TF32、cuDNN benchmark、可扩展显存段）。
+
+    对 Ampere 及以上架构 GPU 启用 TF32 替代 FP32 做矩阵乘法和卷积，
+    精度损失极小但速度提升显著；同时启用 cuDNN benchmark 自动选择
+    最快卷积算法（输入尺寸固定时效果最佳）。
+
+    建议仅在预训练等长时间任务中调用一次。
+    """
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    Logger("⚡ CUDA: TF32 + cuDNN benchmark + expandable_segments enabled")
+
+
+def setup_wandb(args, ckp_data=None, run_name_prefix=None):
+    """初始化 wandb / swanlab 日志记录器，自动支持断点续训。
+
+    若 ``ckp_data`` 中存有先前 run 的 ``wandb_id``，会自动以 ``resume='must'`` 接续。
+
+    Args:
+        args: argparse 解析得到的命令行参数对象，需包含 ``use_wandb``、``wandb_project``，
+            可选包含 ``epochs``、``batch_size``、``learning_rate``。
+        ckp_data: 检查点数据字典（可为 None），用于读取历史 wandb_id。
+        run_name_prefix: 自定义 run 名前缀，默认从 ``wandb_project`` 推导。
+
+    Returns:
+        wandb 模块对象（实际为 swanlab）；若未启用或非主进程则返回 None。
+    """
+    if not getattr(args, "use_wandb", False) or not is_main_process():
+        return None
+
+    import swanlab as wandb
+
+    wandb_id = ckp_data.get("wandb_id") if ckp_data else None
+    resume = "must" if wandb_id else None
+
+    prefix = run_name_prefix or getattr(args, "wandb_project", "MiniMind")
+    epochs = getattr(args, "epochs", "?")
+    batch_size = getattr(args, "batch_size", "?")
+    lr = getattr(args, "learning_rate", "?")
+    run_name = f"{prefix}-Epoch-{epochs}-BatchSize-{batch_size}-LearningRate-{lr}"
+
+    wandb.init(project=getattr(args, "wandb_project", "MiniMind"),
+               name=run_name, id=wandb_id, resume=resume)
+    return wandb
+
+
+def save_checkpoint(model, lm_config, save_dir, save_weight, *, optimizer=None,
+                    scaler=None, scheduler=None, epoch=0, step=0, wandb=None,
+                    resume_dir="../checkpoints"):
+    """统一的模型权重 + 训练状态保存函数。
+
+    同时完成两件事：
+    1. 将模型权重以 fp16 保存到 ``{save_dir}/{save_weight}_{hidden_size}{_moe}.pth``，
+       供推理直接加载。
+    2. 调用 ``lm_checkpoint`` 把 optimizer / scaler / scheduler / epoch / step 等
+       完整训练状态保存到 ``{resume_dir}/..._resume.pth``，供断点续训使用。
+
+    仅在主进程执行实际保存动作（多进程下其他进程会直接返回）。
+
+    Args:
+        model: 当前训练模型（可被 DDP 或 ``torch.compile`` 包装）。
+        lm_config: 模型配置对象。
+        save_dir: 推理权重保存目录。
+        save_weight: 权重文件前缀名，例如 ``"pretrain"``、``"full_sft"``。
+        optimizer: 优化器实例。
+        scaler: ``torch.amp.GradScaler`` 实例（可为 None）。
+        scheduler: 学习率调度器（可为 None）。
+        epoch: 当前 epoch。
+        step: 当前 step。
+        wandb: wandb / swanlab 实例（用于保存 wandb_id）。
+        resume_dir: 训练状态保存目录。
+    """
+    if not is_main_process():
+        return
+    moe_suffix = "_moe" if lm_config.use_moe else ""
+    weight_path = f"{save_dir}/{save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    raw_model = getattr(raw_model, "_orig_mod", raw_model)
+    # NOTE: 一次性 half().cpu() 拷贝整个 state_dict 在 ≥1B 模型上会带来短暂的内存峰值；
+    # 当前 MiniMind (~100M-400M) 范围下完全可控，未来若训练更大模型可改为按张量分片落盘。
+    state_dict = {k: v.half().cpu() for k, v in raw_model.state_dict().items()}
+    torch.save(state_dict, weight_path)
+    lm_checkpoint(lm_config, weight=save_weight, model=model, optimizer=optimizer,
+                  scaler=scaler, scheduler=scheduler, epoch=epoch, step=step,
+                  wandb=wandb, save_dir=resume_dir)
+    del state_dict
+
+
+def restore_training_state(ckp_data, model, optimizer=None, scaler=None,
+                           scheduler=None, *, strict=False):
+    """从检查点字典恢复模型与训练状态，返回 ``(start_epoch, start_step)``。
+
+    Args:
+        ckp_data: ``lm_checkpoint`` 加载得到的字典；为 None 时直接返回 ``(0, 0)``。
+        model: 待恢复的模型。
+        optimizer: 待恢复的优化器（可为 None）。
+        scaler: 待恢复的 GradScaler（仅当其本身已启用时才会恢复）。
+        scheduler: 待恢复的学习率调度器（可为 None）。
+        strict: ``model.load_state_dict`` 的 strict 参数。默认 ``False`` 以兼容
+            LoRA / 部分加载场景；纯预训练等需要严格匹配权重时可显式传 ``True``。
+
+    Returns:
+        ``(start_epoch, start_step)``：从该位置继续训练。
+    """
+    if not ckp_data:
+        return 0, 0
+    model.load_state_dict(ckp_data["model"], strict=strict)
+    if optimizer is not None and "optimizer" in ckp_data:
+        optimizer.load_state_dict(ckp_data["optimizer"])
+    if scaler is not None and getattr(scaler, "is_enabled", lambda: False)() and "scaler" in ckp_data:
+        scaler.load_state_dict(ckp_data["scaler"])
+    if scheduler is not None and "scheduler" in ckp_data:
+        scheduler.load_state_dict(ckp_data["scheduler"])
+    start_epoch = ckp_data.get("epoch", 0)
+    start_step = ckp_data.get("step", 0)
+    return start_epoch, start_step
+
+
+def wrap_model_for_training(model, *, use_compile=False, local_rank=0):
+    """对模型按需应用 ``torch.compile`` 与 ``DistributedDataParallel`` 包装。
+
+    Args:
+        model: 待包装的原始模型。
+        use_compile: 是否启用 ``torch.compile``（PyTorch 2.0+）。
+        local_rank: 本地 GPU rank（DDP 使用，单卡时忽略）。
+
+    Returns:
+        包装后的模型。未启用 DDP 时与未启用 compile 时均按原状返回。
+    """
+    if use_compile:
+        model = torch.compile(model)
+        Logger("torch.compile enabled")
+    if dist.is_initialized():
+        # MiniMind 的旋转位置编码 buffer 不需要在 DDP 间同步
+        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
+        model = DistributedDataParallel(model, device_ids=[local_rank])
+    return model
+
+
+def build_train_dataloader(dataset, batch_size, *, num_workers=0, device_type="cuda",
+                           start_step=0, train_sampler=None,
+                           persistent_workers=False, prefetch_factor=None):
+    """构造支持断点续训的训练 ``DataLoader``。
+
+    通过 ``SkipBatchSampler`` 自动跳过 ``start_step`` 之前的 batch，
+    实现严格按 step 粒度恢复训练。
+
+    Args:
+        dataset: 训练数据集。
+        batch_size: 每个 batch 的样本数。
+        num_workers: ``DataLoader`` 加载工作进程数。
+        device_type: 设备类型，决定是否启用 ``pin_memory``。
+        start_step: 从该 step 开始训练，前面的 batch 会被跳过。
+        train_sampler: 已存在的 sampler（如 ``DistributedSampler``）；为 None 时使用
+            随机打乱的全量索引。
+        persistent_workers: 是否启用 persistent workers（多 epoch 训练推荐开启）。
+        prefetch_factor: ``DataLoader`` prefetch_factor，仅当 ``num_workers > 0`` 有效。
+
+    Returns:
+        DataLoader 实例。
+    """
+    # 兼容三种 train_sampler 输入：
+    # 1) None       -> 用随机打乱的全量索引；
+    # 2) 索引列表    -> 直接使用；
+    # 3) Sampler 对象（如 DistributedSampler） -> 物化成索引列表后再封装。
+    if train_sampler is None:
+        indices = torch.randperm(len(dataset)).tolist()
+    elif isinstance(train_sampler, list):
+        indices = train_sampler
+    else:
+        indices = list(train_sampler)
+    batch_sampler = SkipBatchSampler(indices, batch_size, skip_batches=start_step)
+    loader_kwargs = {
+        "batch_sampler": batch_sampler,
+        "num_workers": num_workers,
+        "pin_memory": (device_type == "cuda"),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def optimizer_step(optimizer, model_or_params, *, scaler=None, grad_clip=1.0):
+    """统一的优化器更新一步：自动处理 GradScaler 与梯度裁剪。
+
+    Args:
+        optimizer: 优化器实例。
+        model_or_params: 模型对象或参数列表（用于梯度裁剪）。LoRA 训练应仅传 LoRA 参数。
+        scaler: GradScaler 实例。若启用则会先调用 ``unscale_`` 再裁剪。
+        grad_clip: 梯度裁剪阈值；<=0 时跳过裁剪。
+    """
+    params = (model_or_params.parameters()
+              if hasattr(model_or_params, "parameters") else model_or_params)
+    scaler_enabled = scaler is not None and getattr(scaler, "is_enabled", lambda: False)()
+    if scaler_enabled:
+        scaler.unscale_(optimizer)
+    if grad_clip and grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(params, grad_clip)
+    if scaler_enabled:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def update_lr(optimizer, lr):
+    """将所有参数组的学习率统一设置为 ``lr``。"""
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
+def parse_messages_from_chat_prompt(prompt):
+    """从带 ``<|im_start|>`` 标签的 chat 模板字符串中解析 messages 列表。
+
+    用于 RL 训练中从 prompt 反推 ``[{role, content}, ...]`` 结构，
+    以便传给 reward model 评分。
+
+    Args:
+        prompt: 包含 ChatML 格式的字符串。
+
+    Returns:
+        ``[{"role": ..., "content": ...}, ...]`` 列表。
+    """
+    pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
+    matches = re.findall(pattern, prompt, re.DOTALL)
+    return [{"role": role, "content": content.strip()} for role, content in matches]
+
+
+def format_duration(seconds):
+    """将秒数格式化为人类可读的时间字符串。
+
+    Args:
+        seconds: 秒数（可为浮点）。
+
+    Returns:
+        如 ``"30s"`` / ``"5.5min"`` / ``"2h30m"`` 的字符串。
+    """
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}min"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def get_memory_usage(device_type):
+    """返回当前设备的内存使用摘要字符串，用于日志展示。
+
+    Args:
+        device_type: ``"cuda"`` / ``"mps"`` / 其他。
+
+    Returns:
+        如 ``"mem: 12.3/15.0GB"``；CPU 等不支持的设备返回空字符串。
+    """
+    if device_type == "cuda":
+        allocated = torch.cuda.memory_allocated() / 1024 ** 3
+        reserved = torch.cuda.memory_reserved() / 1024 ** 3
+        return f"mem: {allocated:.1f}/{reserved:.1f}GB"
+    if device_type == "mps":
+        allocated = torch.mps.current_allocated_memory() / 1024 ** 3
+        return f"mem: {allocated:.2f}GB"
+    return ""

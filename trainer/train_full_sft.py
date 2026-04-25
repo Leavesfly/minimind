@@ -21,16 +21,20 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import argparse
 import time
 import warnings
+
 import torch
 import torch.distributed as dist
-from contextlib import nullcontext
 from torch import optim
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
-from model.model_minimind import MiniMindConfig
+from torch.utils.data import DistributedSampler
+
 from dataset.lm_dataset import SFTDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, \
-    init_model, SkipBatchSampler, get_default_device, get_device_type
+from model.model_minimind import MiniMindConfig
+from trainer.trainer_utils import (
+    Logger, build_train_dataloader, get_default_device, get_device_type, get_lr,
+    init_distributed_mode, init_model, is_main_process, lm_checkpoint,
+    restore_training_state, save_checkpoint, setup_precision_context, setup_seed,
+    setup_wandb, wrap_model_for_training,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -94,16 +98,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
-                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+            # 统一保存：推理权重 + 训练状态（自动处理 DDP / torch.compile 包装）
+            save_checkpoint(model, lm_config, args.save_dir, args.save_weight,
+                            optimizer=optimizer, scaler=scaler,
+                            epoch=epoch, step=step, wandb=wandb)
             model.train()
-            del state_dict
 
         del input_ids, labels, res, loss
 
@@ -158,32 +157,12 @@ if __name__ == "__main__":
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight,
                              save_dir='../checkpoints') if args.from_resume == 1 else None
 
-    # ========== 3. 设置混合精度 ==========
+    # ========== 3. 设置混合精度（统一工具，自动处理 cuda/mps/cpu 差异） ==========
     device_type = get_device_type(args.device)
+    autocast_ctx, scaler, use_scaler = setup_precision_context(device_type, args.dtype, lm_config)
 
-    # MPS 上 F.scaled_dot_product_attention 性能极差（forward 慢 15x，backward 慢 100x+），
-    # 强制关闭 flash_attn，使用手动 attention 实现
-    if device_type == "mps" and lm_config.flash_attn:
-        lm_config.flash_attn = False
-        Logger('⚡ MPS: flash_attn disabled (SDPA is extremely slow on MPS, using manual attention)')
-
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    if device_type == "cuda":
-        autocast_ctx = torch.cuda.amp.autocast(dtype=dtype)
-    elif device_type == "mps":
-        autocast_ctx = torch.autocast(device_type="mps", dtype=dtype)
-    else:
-        autocast_ctx = nullcontext()
-
-    # ========== 4. 配wandb ==========
-    wandb = None
-    if args.use_wandb and is_main_process():
-        import swanlab as wandb
-
-        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
-        resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+    # ========== 4. 配 wandb（统一工具，自动支持断点续训） ==========
+    wandb = setup_wandb(args, ckp_data, run_name_prefix="MiniMind-Full-SFT")
 
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
@@ -194,23 +173,11 @@ if __name__ == "__main__":
         enabled=False)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
-    # ========== 6. 从ckp恢复状态 ==========
-    start_epoch, start_step = 0, 0
-    if ckp_data:
-        model.load_state_dict(ckp_data['model'])
-        optimizer.load_state_dict(ckp_data['optimizer'])
-        if use_scaler and 'scaler' in ckp_data:
-            scaler.load_state_dict(ckp_data['scaler'])
-        start_epoch = ckp_data['epoch']
-        start_step = ckp_data.get('step', 0)
+    # ========== 6. 从 ckp 恢复状态（统一工具，自动处理 model/optimizer/scaler） ==========
+    start_epoch, start_step = restore_training_state(ckp_data, model, optimizer=optimizer, scaler=scaler)
 
-    # ========== 7. 编译和分布式包装 ==========
-    if args.use_compile == 1:
-        model = torch.compile(model)
-        Logger('torch.compile enabled')
-    if dist.is_initialized():
-        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+    # ========== 7. 编译和分布式包装（统一工具） ==========
+    model = wrap_model_for_training(model, use_compile=bool(args.use_compile), local_rank=local_rank)
 
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):

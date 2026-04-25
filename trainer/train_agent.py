@@ -43,29 +43,23 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import AgentRLDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, \
-    SkipBatchSampler, init_model, LMForRewardModel, get_default_device, get_device_type
-from trainer.rollout_engine import create_rollout_engine, compute_per_token_logps
+from trainer.reward_utils import compute_repetition_penalty
+from trainer.rollout_engine import compute_per_token_logps, create_rollout_engine
+from trainer.trainer_utils import (
+    LMForRewardModel, Logger, SkipBatchSampler, build_train_dataloader,
+    get_default_device, get_device_type, init_distributed_mode, init_model,
+    is_main_process, lm_checkpoint, restore_training_state, save_checkpoint,
+    setup_precision_context, setup_seed, setup_wandb, wrap_model_for_training,
+)
 
 warnings.filterwarnings('ignore')
 
 
 # ================================ 工具与 Reward = Start ================================
 
-def rep_penalty(text, n=3, cap=0.5):
-    """计算文本中 n-gram 重复度，用于惩罚重复生成内容
-    
-    Args:
-        text: 待评估的文本
-        n: n-gram 的 n 值
-        cap: 惩罚上限
-    
-    Returns:
-        重复惩罚值（0 ~ cap）
-    """
-    toks = re.findall(r"\w+|[^\w\s]", text.lower())
-    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
-    return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
+# n-gram 重复惩罚统一抽取到 trainer.reward_utils.compute_repetition_penalty，
+# 这里保留 rep_penalty 同名别名以维持本文件其他位置的 API 兼容
+rep_penalty = compute_repetition_penalty
 
 
 # ======== 工具定义 ========
@@ -565,16 +559,11 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
-                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scheduler=scheduler)
+            # 统一保存：推理权重 + 训练状态（Agent RL 需保存 scheduler）
+            save_checkpoint(model, lm_config, args.save_dir, args.save_weight,
+                            optimizer=optimizer, scheduler=scheduler,
+                            epoch=epoch, step=step, wandb=wandb)
             model.train()
-            del state_dict
 
         del per_token_logps, ref_per_token_logps
         del completions, rewards, grouped_rewards, mean_r, std_r, advantages, completion_mask
@@ -658,15 +647,8 @@ if __name__ == "__main__":
     else:
         autocast_ctx = nullcontext()
 
-    wandb = None
-    if args.use_wandb and is_main_process():
-        import swanlab as wandb
-
-        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
-        resume = 'must' if wandb_id else None
-        wandb.init(project=args.wandb_project,
-                   name=f"Agent-RL-E{args.epochs}-B{args.batch_size}-LR{args.learning_rate}", id=wandb_id,
-                   resume=resume)
+    # 统一工具配置 wandb，自动支持断点续训
+    wandb = setup_wandb(args, ckp_data, run_name_prefix="Agent-RL")
 
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
 

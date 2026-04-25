@@ -20,28 +20,34 @@ import argparse
 import math
 import re
 import warnings
-import torch
-import torch.nn.functional as F
-import torch.distributed as dist
+
 from contextlib import nullcontext
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from model.model_minimind import MiniMindConfig
+from torch.utils.data import DataLoader, DistributedSampler
+
 from dataset.lm_dataset import RLAIFDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, \
-    SkipBatchSampler, init_model, LMForRewardModel, get_default_device, get_device_type
-from trainer.rollout_engine import create_rollout_engine, compute_per_token_logps
+from model.model_minimind import MiniMindConfig
+from trainer.reward_utils import compute_repetition_penalty
+from trainer.rollout_engine import compute_per_token_logps, create_rollout_engine
+from trainer.trainer_utils import (
+    LMForRewardModel, Logger, SkipBatchSampler, build_train_dataloader,
+    get_default_device, get_device_type, init_distributed_mode, init_model,
+    is_main_process, lm_checkpoint, restore_training_state, save_checkpoint,
+    setup_precision_context, setup_seed, setup_wandb, wrap_model_for_training,
+)
 
 warnings.filterwarnings('ignore')
 
 
-# 计算 n-gram 重复惩罚：统计文本中 3-gram 的重复比例，cap 为惩罚上限
-def rep_penalty(text, n=3, cap=0.5):
-    toks = re.findall(r"\w+|[^\w\s]", text.lower())
-    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
-    return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
+# n-gram 重复惩罚已统一抽取至 trainer.reward_utils.compute_repetition_penalty，
+# 这里保留 rep_penalty 别名以兼容本文件中现有的奖励计算逻辑
+rep_penalty = compute_repetition_penalty
 
 
 def calculate_rewards(prompts, responses, reward_model):
@@ -240,16 +246,11 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
-                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scheduler=scheduler)
+            # 统一保存：推理权重 + 训练状态（GRPO 需保存 scheduler）
+            save_checkpoint(model, lm_config, args.save_dir, args.save_weight,
+                            optimizer=optimizer, scheduler=scheduler,
+                            epoch=epoch, step=step, wandb=wandb)
             model.train()
-            del state_dict
 
     if step > start_step and step % args.accumulation_steps != 0:
         if args.grad_clip > 0:
@@ -320,32 +321,12 @@ if __name__ == "__main__":
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight,
                              save_dir='../checkpoints') if args.from_resume == 1 else None
 
-    # ========== 3. 设置混合精度 ==========
+    # ========== 3. 设置混合精度（统一工具，自动处理 cuda/mps/cpu 差异） ==========
     device_type = get_device_type(args.device)
+    autocast_ctx, _scaler_unused, _ = setup_precision_context(device_type, args.dtype, lm_config)
 
-    # MPS 上 F.scaled_dot_product_attention 性能极差（forward 慢 15x，backward 慢 100x+），
-    # 强制关闭 flash_attn，使用手动 attention 实现
-    if device_type == "mps" and lm_config.flash_attn:
-        lm_config.flash_attn = False
-        Logger('⚡ MPS: flash_attn disabled (SDPA is extremely slow on MPS, using manual attention)')
-
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    if device_type == "cuda":
-        autocast_ctx = torch.cuda.amp.autocast(dtype=dtype)
-    elif device_type == "mps":
-        autocast_ctx = torch.autocast(device_type="mps", dtype=dtype)
-    else:  # cpu
-        autocast_ctx = nullcontext()
-
-    # ========== 4. 配wandb ==========
-    wandb = None
-    if args.use_wandb and is_main_process():
-        import swanlab as wandb
-
-        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
-        resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-GRPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+    # ========== 4. 配 wandb（统一工具，自动支持断点续训） ==========
+    wandb = setup_wandb(args, ckp_data, run_name_prefix="MiniMind-GRPO")
 
     # ========== 5. 初始化模型和数据 ==========
     base_weight = args.from_weight
@@ -377,21 +358,20 @@ if __name__ == "__main__":
     total_optimizer_steps = math.ceil(iters / args.accumulation_steps) * args.epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
 
-    # ========== 6. 从ckp恢复状态 ==========
-    start_epoch, start_step = 0, 0
-    if ckp_data:
-        model.load_state_dict(ckp_data['model'])
-        optimizer.load_state_dict(ckp_data['optimizer'])
-        scheduler.load_state_dict(ckp_data['scheduler'])
-        start_epoch = ckp_data['epoch']
-        start_step = ckp_data.get('step', 0)
+    # ========== 6. 从 ckp 恢复状态（统一工具，自动处理 model/optimizer/scheduler） ==========
+    start_epoch, start_step = restore_training_state(
+        ckp_data, model, optimizer=optimizer, scheduler=scheduler)
 
     # ========== 7. 编译和分布式包装 ==========
+    # NOTE: 此处不复用 trainer_utils.wrap_model_for_training，因为 GRPO 需要在
+    # torch.compile 完成后立即把"已编译模型"注入 rollout_engine（保证生成时使用编译版），
+    # 这一耦合无法通过通用 helper 表达，故保留显式实现。
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
         rollout_engine.update_policy(model)
     if dist.is_initialized():
+        # MiniMind 旋转位置编码 buffer 不需要 DDP 同步
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
     if is_main_process():
