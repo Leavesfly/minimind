@@ -30,9 +30,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from dataset.lm_dataset import SFTDataset
 from model.model_minimind import MiniMindConfig
 from trainer.trainer_utils import (
-    Logger, SkipBatchSampler, build_train_dataloader, get_default_device, get_device_type, get_lr,
+    Logger, SkipBatchSampler, get_default_device, get_device_type, get_lr,
     init_distributed_mode, init_model, is_main_process, lm_checkpoint,
-    restore_training_state, save_checkpoint, setup_precision_context, setup_seed,
+    restore_training_state, save_checkpoint, setup_seed,
     setup_wandb, wrap_model_for_training,
 )
 
@@ -181,7 +181,9 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
 
             Logger(
-                f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, ce: {current_ce_loss:.4f}, aux_loss: {current_aux_loss:.4f}, distill: {distill_loss.item():.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
+                f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, ce: {current_ce_loss:.4f}'
+                f', aux_loss: {current_aux_loss:.4f}, distill: {distill_loss.item():.4f}, learning_rate: {current_lr:.8f}'
+                f', epoch_time: {eta_min:.3f}min')
 
             if wandb:
                 wandb.log({

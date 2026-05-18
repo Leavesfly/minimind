@@ -17,9 +17,9 @@ from dataset.lm_dataset import SFTDataset
 from model.model_lora import apply_lora, save_lora
 from model.model_minimind import MiniMindConfig
 from trainer.trainer_utils import (
-    Logger, SkipBatchSampler, build_train_dataloader, get_default_device, get_device_type, get_lr,
+    Logger, SkipBatchSampler, get_default_device, get_device_type, get_lr,
     init_distributed_mode, init_model, is_main_process, lm_checkpoint,
-    restore_training_state, save_checkpoint, setup_precision_context, setup_seed,
+    restore_training_state, setup_precision_context, setup_seed,
     setup_wandb, wrap_model_for_training,
 )
 
@@ -84,7 +84,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(
-                f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+                f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}'
+                f', aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss,
                                  "learning_rate": current_lr, "epoch_time": eta_min})
 
