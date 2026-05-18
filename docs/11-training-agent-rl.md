@@ -122,8 +122,7 @@ sequenceDiagram
         Policy-->>Engine: tool_call
         Engine->>Tools: execute
         Tools-->>Engine: tool_response
-        Engine->>Policy: generate (turn 2)
-        ...
+        Engine->>Policy: generate (turn 2…N)
     end
     Engine->>Reward: trajectory + answer_check
     Reward-->>Policy: rewards
@@ -164,100 +163,5 @@ python trainer/train_agent.py \
 |------|------|--------------|
 | OpenAI Function Calling | API 级 | ChatML `<tool_call>` 标签 |
 | LangGraph | 状态机调度 | RolloutEngine 内联循环 |
-| AutoGPT / ReAct | 思考-行动循环 | ``
-- **`tool_calls` 字段**：自动解析 `<tool_call>{...}</tool_call>` → OpenAI Function Calling 格式
-- **`tools` 参数注入**：传入 OpenAI 风格 tools，自动渲染到 chat_template
-
-### 12.4.4 解析逻辑
-
-`parse_response(text)` 把模型输出拆为三段：
-
-```python
-def parse_response(text):
-    reasoning = re.search(r"", text, re.DOTALL)
-    tool_calls = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
-    content = re.sub(r"<think>.*?</think>|<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
-    return content.strip(), reasoning, parsed_tool_calls
-```
-
-## 12.5 Streamlit Web Demo
-
-```bash
-streamlit run scripts/web_demo.py -- \
-    --weight full_sft --hidden_size 512
-```
-
-提供：
-- 对话历史保留
-- 温度 / top_p / max_tokens 滑块
-- 思考内容折叠显示
-- Tool Call 高亮
-- 模型切换（Dense / MoE / LoRA）
-
-## 12.6 极简 SDK：`chat_api.py`
-
-```python
-from scripts.chat_api import ChatClient
-
-client = ChatClient(weight="full_sft", hidden_size=512, device="cuda")
-reply = client.chat([{"role": "user", "content": "讲个笑话"}])
-print(reply)
-```
-
-适合嵌入到自动化脚本、unit test。内部封装：tokenizer + model + chat_template + 简易 history 管理。
-
-## 12.7 权重格式转换：`convert_model.py`
-
-支持三类操作：
-
-### 12.7.1 PyTorch → HuggingFace 格式
-
-```bash
-python scripts/convert_model.py --to_hf \
-    --weight full_sft --hidden_size 512 \
-    --output_dir ./hf_minimind
-```
-
-输出标准 HuggingFace 目录（含 `config.json`、`pytorch_model.bin`、`tokenizer.json`），可直接 `AutoModelForCausalLM.from_pretrained` 加载，并上传 HF Hub。
-
-### 12.7.2 HuggingFace → PyTorch
-
-```bash
-python scripts/convert_model.py --from_hf \
-    --hf_dir jingyaogong/MiniMind3 \
-    --output_path ./out/from_hf_512.pth
-```
-
-### 12.7.3 LoRA 合并（详见 `07-training-lora.md`）
-
-```bash
-python scripts/convert_model.py --merge_lora \
-    --base_weight full_sft --lora_weight lora_medical \
-    --output_path ./out/merged.pth
-```
-
-## 12.8 推理性能优化建议
-
-| 优化 | 实现方式 | 预期加速 |
-|------|---------|---------|
-| Flash Attention | `lm_config.flash_attn=True`（默认开） | 2-3× |
-| KV Cache | 默认开（`use_cache=True`） | 长文本必备 |
-| `torch.compile` | `model = torch.compile(model)` | 1.3-1.8×（PyTorch ≥ 2.1） |
-| bf16 推理 | `model.to(dtype=torch.bfloat16)` | 1.5×（A100/H100） |
-| llama.cpp / GGUF | 用 `convert_model.py --to_hf` 后转 GGUF | CPU 友好 |
-| vllm | HF 格式直接被 vllm 加载 | 4-10× 吞吐 |
-
-## 12.9 长文本推理（YaRN）
-
-```bash
-python eval_llm.py --weight full_sft \
-    --inference_rope_scaling \
-    --max_new_tokens 30000
-```
-
-启用后 `MiniMindConfig.rope_scaling = {"type":"yarn","factor":16,...}`，
-有效上下文从 2048 扩展到 32768，无需重训。详见 [03 - 模型架构](./03-model-architecture.md) §3.4.2。
-
-## 12.10 多模态预留
-
-虽然主线模型为纯文本，但 chat_template 已为图文混排预留位置。后续如要扩展 VLM，可参考 README 中提到的 `MiniMind-V` 路线。
+| AutoGPT / ReAct | 思考-行动循环 | `<think>` + `<tool_call>` 多轮循环 |
+| Toolformer | 模型自学何时调工具 | RL reward 引导工具调用时机 |

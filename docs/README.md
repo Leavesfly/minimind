@@ -18,7 +18,9 @@ MiniMind3 是一个完全从 0 实现的极小语言模型项目，主线 Dense 
 | 文档 | 内容简介 |
 |------|---------|
 | [03 - 模型架构](./03-model-architecture.md) | `MiniMindConfig`、Dense/MoE 结构、RMSNorm、RoPE+YaRN、GQA、Flash Attention、MoE Router 与负载均衡损失 |
-| [04 - Tokenizer 与 Chat Template](./04-tokenizer-and-chat-template.md) | BPE+ByteLevel 分词器、特殊 token、`` 思考块
+| [05 - 数据管道](./05-dataset-pipeline.md) | `lm_dataset.py` 5 类 Dataset 的处理流程、多进程优化、MPS 零拷贝、int16 紧凑存储 |
+| [15 - 训练数据格式详解](./15-dataset-formats.md) | `.dataset/` 下各数据文件的格式规范、使用方式、设计原因、自定义数据指南 |
+| [16 - 训练方法基本原理](./16-training-principles.md) | 从第一性原理解释预训练、SFT、LoRA、DPO、蒸馏、PPO、GRPO、Agent RL 为什么有效 |
 - **Tool Call**：基于 `<tool_call>` 模板的 OpenAI Function Calling 兼容协议
 - **多轮 Agent Rollout**：`train_agent.py` 中实现的多轮 tool-use 强化学习训练框架
 - **可插拔 Rollout Engine**：`TorchRolloutEngine` / `SGLangRolloutEngine` 双后端

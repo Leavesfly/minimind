@@ -51,25 +51,41 @@ def get_model_params(model, config):
     Returns:
         无返回值，直接打印参数量信息
     """
+    # 总参数量（所有专家参数均计入）
     total = sum(p.numel() for p in model.parameters()) / 1e6
+
+    # MoE 相关配置：路由专家数、每次激活的专家数、共享专家数
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
     n_active = getattr(config, 'num_experts_per_tok', 0)
     n_shared = getattr(config, 'n_shared_experts', 0)
+
+    # 单个路由专家和共享专家的参数量（通过第 0 号专家推算）
     expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0.' in n) / 1e6
     shared_expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0.' in n) / 1e6
+
+    # 激活参数量 = 非专家基础参数 + 实际激活的路由专家参数 + 全部共享专家参数
     base = total - (expert * n_routed) - (shared_expert * n_shared)
     active = base + (expert * n_active) + (shared_expert * n_shared)
+
     if active < total:
+        # MoE 模型：显示 "总参数-A激活参数" 格式
         Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
     else:
+        # Dense 模型：所有参数均为激活参数
         Logger(f'Model Params: {total:.2f}M')
 
 
 def is_main_process():
+    """判断当前进程是否为主进程（rank 0）。
+    
+    在非分布式模式下始终返回 True；DDP 模式下仅 rank 0 返回 True。
+    用于控制日志打印、模型保存等只需主进程执行的操作。
+    """
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def Logger(content):
+    """仅在主进程打印日志内容，避免多 GPU 训练时日志重复输出。"""
     if is_main_process():
         print(content)
 
@@ -93,7 +109,11 @@ def get_lr(current_step, total_steps, lr):
 
 
 def get_default_device():
-    """自动检测最佳可用设备：cuda > mps > cpu"""
+    """自动检测最佳可用设备，优先级：NVIDIA CUDA > Apple MPS > CPU。
+    
+    Returns:
+        设备字符串，如 "cuda:0"、"mps" 或 "cpu"
+    """
     if torch.cuda.is_available():
         return "cuda:0"
     elif torch.backends.mps.is_available():
@@ -102,7 +122,17 @@ def get_default_device():
 
 
 def get_device_type(device):
-    """从设备字符串中提取设备类型"""
+    """从设备字符串中提取设备类型（去除具体编号）。
+    
+    例如 "cuda:0" -> "cuda", "mps" -> "mps", "cpu" -> "cpu"。
+    用于后续根据设备类型选择不同的混合精度策略、pin_memory 配置等。
+    
+    Args:
+        device: 设备字符串或 torch.device 对象
+    
+    Returns:
+        设备类型字符串："cuda"、"mps" 或 "cpu"
+    """
     device_str = str(device)
     if "cuda" in device_str:
         return "cuda"
@@ -123,23 +153,36 @@ def init_distributed_mode():
         local_rank: 当前进程的本地 GPU rank，单卡模式返回 0
     """
     if int(os.environ.get("RANK", -1)) == -1:
-        return 0  # 非DDP模式
+        return 0  # RANK 未设置或为 -1，表示单机单卡模式
 
+    # 使用 NCCL 后端初始化进程组（NCCL 是 NVIDIA GPU 间通信最优后端）
     dist.init_process_group(backend="nccl")
+    # LOCAL_RANK 表示当前节点内的 GPU 编号（多机多卡时不同于全局 RANK）
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(local_rank)  # 绑定当前进程到对应 GPU
     return local_rank
 
 
 def setup_seed(seed: int):
+    """设置全局随机种子，确保训练可复现。
+    
+    统一设置 Python random、NumPy、PyTorch（CPU/GPU）的随机种子，
+    并关闭 cuDNN 的非确定性算法优化，保证相同输入产生相同输出。
+    
+    注意：开启 deterministic 模式会牺牲部分性能。若对速度敏感且不需要
+    严格复现，可在调用后手动恢复 ``torch.backends.cudnn.benchmark = True``。
+    
+    Args:
+        seed: 随机种子值
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.cuda.manual_seed_all(seed)  # 多 GPU 场景下设置所有 GPU 的种子
+        torch.backends.cudnn.deterministic = True  # 使用确定性算法
+        torch.backends.cudnn.benchmark = False     # 关闭自动调优（与 deterministic 冲突）
 
 
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None,
@@ -172,18 +215,26 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         加载模式时返回检查点数据，保存模式时返回 None
     """
     os.makedirs(save_dir, exist_ok=True)
+    # 构造文件路径：通过 hidden_size 和 moe 后缀区分不同规模/架构的权重文件
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
     resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
 
     if model is not None:
+        # ---- 保存模式 ----
+        # 解包 DDP 和 torch.compile 包装，获取原始模型
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-        raw_model = getattr(raw_model, '_orig_mod', raw_model)
+        raw_model = getattr(raw_model, '_orig_mod', raw_model)  # torch.compile 会包一层 _orig_mod
         state_dict = raw_model.state_dict()
+        # 转为 fp16 并移到 CPU，减小文件体积（推理时可直接加载）
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
+
+        # 使用 tmp 文件 + 原子替换（os.replace），避免保存中断导致文件损坏
         ckp_tmp = ckp_path + '.tmp'
         torch.save(state_dict, ckp_tmp)
         os.replace(ckp_tmp, ckp_path)
+
+        # 提取 wandb/swanlab 的 run id，用于断点续训时恢复同一个实验
         wandb_id = None
         if wandb:
             if hasattr(wandb, 'get_run'):
@@ -192,32 +243,38 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
             else:
                 wandb_id = getattr(wandb, 'id', None)
 
+        # 构造完整的训练状态字典（用于断点续训）
         resume_data = {
             'model': state_dict,
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
             'step': step,
-            'world_size': dist.get_world_size() if dist.is_initialized() else 1,
+            'world_size': dist.get_world_size() if dist.is_initialized() else 1,  # 记录 GPU 数量，便于跨配置恢复
             'wandb_id': wandb_id
         }
+        # 保存额外的 kwargs 状态（如 scheduler、scaler、ema 等）
         for key, value in kwargs.items():
             if value is not None:
                 if hasattr(value, 'state_dict'):
+                    # 有 state_dict 方法的对象（如 scheduler），解包后序列化
                     raw_value = value.module if isinstance(value, DistributedDataParallel) else value
                     raw_value = getattr(raw_value, '_orig_mod', raw_value)
                     resume_data[key] = raw_value.state_dict()
                 else:
                     resume_data[key] = value
 
+        # 同样使用原子替换保存 resume 文件
         resume_tmp = resume_path + '.tmp'
         torch.save(resume_data, resume_tmp)
         os.replace(resume_tmp, resume_path)
         del state_dict, resume_data
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    else:  # 加载模式
+            torch.cuda.empty_cache()  # 释放临时显存占用
+    else:
+        # ---- 加载模式 ----
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
+            # 处理 GPU 数量变化：按等效数据量换算 step（确保训练进度等价）
             saved_ws = ckp_data.get('world_size', 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
             if saved_ws != current_ws:
@@ -241,20 +298,26 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     Returns:
         (model, tokenizer) 元组
     """
+    # 将相对路径转为基于当前脚本目录的绝对路径，确保从任意工作目录调用都能正确定位文件
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if not os.path.isabs(tokenizer_path):
         tokenizer_path = os.path.normpath(os.path.join(script_dir, tokenizer_path))
     if not os.path.isabs(save_dir):
         save_dir = os.path.normpath(os.path.join(script_dir, save_dir))
+
+    # 加载 tokenizer（使用 HuggingFace AutoTokenizer，支持自定义 chat template）
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    # 创建模型实例（随机初始化）
     model = MiniMindForCausalLM(lm_config)
 
+    # 加载预训练权重（strict=False 允许部分键缺失，兼容 LoRA 等场景）
     if from_weight != 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
         weights = torch.load(weight_path, map_location=device)
         model.load_state_dict(weights, strict=False)
 
+    # 打印模型参数量信息（含 MoE 激活参数量统计）
     get_model_params(model, lm_config)
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
     return model.to(device), tokenizer
@@ -349,25 +412,35 @@ class LMForRewardModel:
 
     @torch.no_grad()
     def get_score(self, messages, response):
-        """
-        对回复进行评分
+        """对回复进行评分
+        
+        将多轮对话历史和最新问题拼接为单条上下文，再与待评分回复组成
+        一个 user-assistant 对，送入 Reward Model 打分。
+        
+        评分流程：
+        1. 拼接对话历史（除最后一条）为背景文本
+        2. 将最后一条用户消息作为当前问题
+        3. 构造 [user_context, assistant_response] 格式送入模型
+        4. 获取原始分数并 clip 到 [-3.0, 3.0]
         
         Args:
-            messages: 对话历史消息列表
-            response: 待评分的回复内容
+            messages: 对话历史消息列表，格式为 [{"role": ..., "content": ...}, ...]
+            response: 待评分的模型回复文本
         
         Returns:
-            score: 评分，范围 [-3.0, 3.0]
+            score: 评分，范围 [-3.0, 3.0]，越高表示质量越好
         """
+        # 拼接除最后一条外的历史对话作为背景上下文
         history_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages[:-1]])
         last_query = messages[-1]['content'] if messages else ""
+        # 将历史 + 最新问题合并为一条 user message
         message_context = f"{history_text}\n以上是对话历史。我的新问题是：\n{last_query}" if history_text else last_query
         eval_messages = [
             {"role": "user", "content": message_context},
             {"role": "assistant", "content": response}
         ]
         score = self.model.get_score(self.tokenizer, eval_messages)
-        return max(min(score, 3.0), -3.0)
+        return max(min(score, 3.0), -3.0)  # clip 防止极端分数干扰训练
 
 
 # =====================================================================================
@@ -626,19 +699,24 @@ def optimizer_step(optimizer, model_or_params, *, scaler=None, grad_clip=1.0):
         scaler: GradScaler 实例。若启用则会先调用 ``unscale_`` 再裁剪。
         grad_clip: 梯度裁剪阈值；<=0 时跳过裁剪。
     """
+    # 统一处理传入 model 对象或裸参数列表两种情况
     params = (model_or_params.parameters()
               if hasattr(model_or_params, "parameters") else model_or_params)
     scaler_enabled = scaler is not None and getattr(scaler, "is_enabled", lambda: False)()
+
     if scaler_enabled:
+        # GradScaler 启用时，先反缩放梯度到真实值，再做裁剪
         scaler.unscale_(optimizer)
     if grad_clip and grad_clip > 0:
+        # 全局梯度范数裁剪，防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(params, grad_clip)
     if scaler_enabled:
+        # 使用 scaler.step 替代 optimizer.step，内部会跳过含 inf/nan 梯度的 step
         scaler.step(optimizer)
-        scaler.update()
+        scaler.update()  # 动态调整 loss scale 因子
     else:
         optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=True)  # set_to_none=True 比 zero_grad() 更省显存
 
 
 def update_lr(optimizer, lr):
