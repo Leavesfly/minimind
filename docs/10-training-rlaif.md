@@ -1,18 +1,24 @@
-# 10 - RLAIF：PPO / GRPO / CISPO
+# 10 - RLAIF：让模型在"考试"中学会自我修正（PPO / GRPO / CISPO）
 
+> **核心思想**：为什么 SFT 还不够？因为 SFT 只是"模仿标准答案"，而真实世界里很多问题没有唯一解。RLAIF 让模型像学生一样**自己试错、自己打分、自己调整策略**，从"背答案"进化到"会思考"。
+> 
 > 对应代码：`trainer/train_ppo.py` / `trainer/train_grpo.py` + `trainer/rollout_engine.py` + `trainer/reward_utils.py` + `dataset/lm_dataset.py:RLAIFDataset`
 
-## 10.1 RLAIF 在 MiniMind3 中的定位
+## 10.1 为什么需要让模型"自己试错"？——RLAIF 的定位
 
-RLAIF（Reinforcement Learning from AI Feedback）泛指**用规则或 AI 模型作为 Reward 信号**进行 RL 训练。MiniMind3 内置了三种主流策略：
+想象一个场景：你教学生做数学题，SFT 阶段你已经给了大量例题和标准解法，学生背得很熟。但考试中遇到新题型时，学生只会套公式，不会灵活变通。
 
-| 算法 | 核心思想 | 适用场景 | 是否需要 Critic |
-|------|---------|---------|----------------|
-| **PPO** | Actor-Critic + clipped surrogate | 通用 RLHF | ✅ |
-| **GRPO** | 组内归一化 advantage，无 Critic | 推理类任务（数学/代码） | ❌ |
-| **CISPO** | Clipped Importance Sampling Policy Optimization | 长序列稳定训练 | ❌ |
+**RLAIF 要解决的正是这个问题**：让模型不再依赖"标准答案"，而是通过**自己尝试→获得反馈→调整策略**的循环，学会在不确定环境中做出更好决策。
 
-> 三者共享一套 Rollout Engine 与 Reward Utils，只在 loss 与 advantage 计算上不同。
+MiniMind3 内置了三种主流策略，它们的核心区别在于**"谁来当老师打分"**：
+
+| 算法 | 类比 | 核心思想 | 适用场景 | 是否需要 Critic |
+|------|------|---------|---------|----------------|
+| **PPO** | 「带老师的实习」——自己试着做，老师打分，调整策略 | Actor-Critic + clipped surrogate | 通用 RLHF | ✅ |
+| **GRPO** | 「同学之间比较」——不需要老师打分，只需看谁在同学中做得更好 | 组内归一化 advantage，无 Critic | 推理类任务（数学/代码） | ❌ |
+| **CISPO** | 「GRPO 的改良版」——防止某个同学的极端表现影响全班 | Clipped Importance Sampling Policy Optimization | 长序列稳定训练 | ❌ |
+
+> 三者共享一套 Rollout Engine（考试系统）与 Reward Utils（评分规则），只在 loss 与 advantage 计算上不同。
 
 ## 10.2 公共组件：Rollout Engine
 

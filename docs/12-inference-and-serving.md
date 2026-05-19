@@ -1,8 +1,10 @@
-# 12 - 推理与服务部署
+# 12 - 推理与服务部署：让模型「毕业上班」
 
 > 对应代码：`eval_llm.py` + `scripts/serve_openai_api.py` + `scripts/chat_api.py` + `scripts/web_demo.py` + `scripts/convert_model.py`
 
-## 12.1 推理入口总览
+训练模型就像培养一个高材生，但只有让它「毕业上班」、真正为人服务，才算完成了闭环。本章介绍如何让 MiniMind3 从实验室走向生产环境，通过标准化的接口、高效的缓存机制和通用的格式转换，让模型在各种平台上稳定工作。
+
+## 12.1 推理入口总览：模型毕业后的多种工作岗位
 
 | 入口 | 场景 | 说明 |
 |------|------|------|
@@ -12,9 +14,9 @@
 | `scripts/web_demo.py` | Streamlit 网页 | 演示 / 用户体验 |
 | `scripts/convert_model.py` | 权重转换 | torch → HF / GGUF / LoRA 合并 |
 
-## 12.2 模型加载流程
+## 12.2 模型加载流程：新员工入职手续
 
-所有入口共用同一份初始化流程：
+所有入口共用同一份初始化流程，就像为新员工办理入职：准备工牌（Tokenizer）、分配工位（Model）、发放制服（Weights），如果有特殊技能（LoRA）还要额外登记。
 
 ```python
 def init_model(lm_config, weight, lora_weight=None, device=None):
@@ -63,9 +65,9 @@ python eval_llm.py \
 
 支持 **流式输出**（TextStreamer）和**非流式**两种模式。
 
-## 12.4 `serve_openai_api.py`：OpenAI 兼容服务
+## 12.4 `serve_openai_api.py`：标准化的「服务窗口」
 
-最重要的部署入口。基于 FastAPI 实现，**接口完全兼容 OpenAI Chat Completions API**，可被以下生态直接接入：
+这是最重要的部署入口。想象一下，如果每个模型都有自己的「方言」，那接入方就得学无数种语言。OpenAI 兼容 API 就像 **USB 接口标准**——不管你是键盘、鼠标还是 U 盘，只要符合 USB 规范，插上去就能用。基于 FastAPI 实现，**接口完全兼容 OpenAI Chat Completions API**，可被以下生态直接接入：
 
 - LobeChat / NextChat / Open-WebUI
 - LangChain / LlamaIndex
@@ -178,9 +180,9 @@ streamlit run scripts/web_demo.py -- --weight rlhf
 
 适合 demo 与可视化体验。
 
-## 12.7 `convert_model.py`：权重转换
+## 12.7 `convert_model.py`：给模型办「通用工作签证」
 
-提供 6 个转换函数，**通过修改 `__main__` 中的注释/调用切换功能**（无 argparse）：
+训练好的模型如果只待在自家框架里，就像只会说方言的人，很难去其他平台工作。权重转换就是给模型办一张「通用工作签证」——把它翻译成 HuggingFace、GGUF 等通用格式，让它能去 vLLM、llama.cpp、Ollama 等各种平台「打工」。提供 6 个转换函数，**通过修改 `__main__` 中的注释/调用切换功能**（无 argparse）：
 
 | 函数 | 用途 |
 |------|------|
@@ -243,9 +245,9 @@ YaRN 的实现细节（线性斜坡、attention_factor 等）见 [03 - 模型架
 
 设备类型由 `--device` 参数指定，默认 `cuda`（CPU/MPS 需手动设为 `cpu`/`mps`）。模型加载后 `.half().eval().to(device)`，推理走 fp16。
 
-## 12.10 与第三方推理框架集成
+## 12.10 与第三方推理框架集成：派遣到其他平台工作
 
-通过 `convert_torch2transformers`（**Qwen3 兼容格式**）转换后的权重可被以下框架直接加载：
+通过 `convert_torch2transformers`（**Qwen3 兼容格式**）转换后的权重，就像拿到了「国际通用护照」，可以被以下框架直接加载并「派遣」到各种平台上工作：
 
 - **vLLM**：`from vllm import LLM; llm = LLM(model="./minimind-3")`
 - **llama.cpp**：用 llama.cpp 自带 `convert_hf_to_gguf.py` 转 GGUF 后用 `llama-server` 启动
