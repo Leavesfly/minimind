@@ -204,25 +204,44 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
                    device="cuda"):
     """单样本多轮工具调用 rollout
     
-    模拟 Agent 与工具的多轮交互流程：
-    1. 根据用户消息生成初始响应
-    2. 解析响应中的工具调用
-    3. 执行工具并获取结果
-    4. 将工具结果加入上下文，生成下一轮响应
-    5. 重复直到达到最大轮数或无工具调用
+    模拟 Agent 与工具环境的多轮交互流程，实现完整的 tool-call 循环：
+    
+    **多轮交互机制**：
+    - **第一轮（初始响应）**：根据用户消息生成初始响应，可能包含 tool_call 标签
+    - **中间轮（工具执行）**：解析工具调用 -> 执行工具 -> 将结果作为 observation 追加到上下文 -> 继续生成
+    - **最后轮（最终答案）**：当无工具调用或达到 max_turns 时，生成最终答案
+    
+    **状态追踪**：
+    - response_ids: 拼接所有轮次的 token ids（模型生成 + 工具返回）
+    - response_mask: 标记每个 token 的来源（1=模型生成参与 loss，0=工具返回不参与 loss）
+    - response_old_logps: 记录旧策略的 log probability，用于重要性采样
+    - unfinished: 标记是否因达到 max_turns 而仍有未完成的工具调用
+    
+    **思考模式**：
+    - 按 thinking_ratio 概率开启  思考链
+    - 思考部分计入 response_ids 但不单独区分 mask
     
     Args:
-        rollout_engine: 推理引擎
-        tokenizer: 分词器
-        messages: 对话消息列表
-        tools: 可用工具列表
-        max_turns: 最大交互轮数
-        max_new_tokens: 每轮最大生成长度
-        thinking_ratio: 开启思考模式的概率
-        device: 运行设备
+        rollout_engine: 推理引擎，负责生成候选响应
+        tokenizer: 分词器，用于编码/解码文本
+        messages: 对话消息列表（含用户问题和历史交互）
+        tools: 可用工具列表（OpenAI function calling 格式）
+        max_turns: 最大交互轮数，默认 3 轮
+        max_new_tokens: 每轮最大生成长度，默认 256
+        thinking_ratio: 开启思考模式的概率（0.0~1.0），默认 0.5
+        device: 运行设备，默认 "cuda"
     
     Returns:
-        tuple: (final_output, final_context, prompt_ids, response_ids, response_mask, response_old_logps, turn_outputs, unfinished)
+        tuple: (
+            final_output: 最后一轮的模型输出文本
+            final_context: 完整上下文字符串（含所有轮次）
+            prompt_ids: 首轮 prompt token ids（后续轮不更新）
+            response_ids: 所有轮次拼接后的 response token ids
+            response_mask: response 掩码（1=模型生成，0=环境反馈）
+            response_old_logps: 旧策略 log prob 列表
+            turn_outputs: 每轮模型输出文本列表
+            unfinished: 是否未完成标记（达到 max_turns 仍有工具调用）
+        )
     """
     # ---- 状态变量初始化 ----
     all_outputs = []          # 每轮模型生成的文本列表
@@ -388,23 +407,36 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
                       turn_outputs_batch=None, unfinished_batch=None):
     """计算 Agent 响应的奖励
     
-    奖励计算包含多个维度：
-    1. 无工具调用时：基于格式规范性和 Reward Model 分数
-    2. 有工具调用时：基于工具调用正确性、参数校验、执行结果等
+    奖励计算包含多个维度，针对有无工具调用采用不同的评分策略：
+    
+    **分支 A：无工具调用时**
+    - 格式规范性：响应长度适中（5~800字符）、思考链完整且长度合理（20~300字符）
+    - 标签闭合：<tool_call> 与 </tool_call> 数量匹配、</think> 只出现一次
+    - Reward Model 评分：使用外部预训练模型对回答质量打分
+    - n-gram 重复惩罚：防止生成重复内容
+    
+    **分支 B：有工具调用时**
+    - 工具调用正确性：工具名在允许列表内 + 参数校验通过
+    - 工具对齐分：合法调用数与 GT 期望数的差距 + 无效调用的额外惩罚
+    - GT 命中比例：从最终回答中提取数值，验证是否包含 ground truth
+    - 未完成惩罚：达到 max_turns 仍有工具调用则扣分
+    - n-gram 重复惩罚
+    
+    **奖励范围**：所有奖励最终 clip 到 [-3, 3] 区间，防止极端值影响训练稳定性
     
     Args:
-        prompts: 提示文本列表
-        completions: 生成响应列表
-        gt_batch: ground truth 批次
-        tools_batch: 工具列表批次
-        num_gen: 每个样本的生成数量
-        reward_model: 奖励模型（可选）
+        prompts: 提示文本列表，用于提取对话历史供 Reward Model 使用
+        completions: 生成响应列表（每个样本有 num_gen 个候选）
+        gt_batch: ground truth 批次，期望出现在最终回答中的数值/文本列表
+        tools_batch: 工具列表批次，定义每个样本可用的工具集合
+        num_gen: 每个样本的生成数量（GRPO 组大小）
+        reward_model: 奖励模型（可选），用于无工具调用时的质量评分
         device: 运行设备
-        turn_outputs_batch: 多轮输出批次
-        unfinished_batch: 未完成标记批次
+        turn_outputs_batch: 多轮输出批次，记录每轮的模型输出
+        unfinished_batch: 未完成标记批次，标识是否因达到 max_turns 而中断
     
     Returns:
-        奖励张量，形状为 [batch_size * num_gen]
+        torch.Tensor: 奖励张量，形状为 [batch_size * num_gen]，每个元素对应一个候选的奖励值
     """
     rewards = torch.zeros(len(completions), device=device)
     for idx, response in enumerate(completions):
@@ -489,22 +521,55 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
                    use_sglang=False):
     """执行一个 epoch 的强化学习训练
     
-    训练流程：
-    1. 批量生成 rollout
-    2. 计算奖励和优势值
-    3. 使用 PPO/GRPO 算法更新策略
-    4. 定期保存模型和记录日志
+    完整的 on-policy 强化学习训练循环，包含以下 8 个阶段：
+    
+    **Phase 1: Rollout（候选生成）**
+    - 无梯度模式下使用旧策略生成 num_gen 个候选响应
+    - 支持多轮工具调用交互，每个候选可能包含多次 tool-call
+    
+    **Phase 2: 构造训练张量**
+    - 将 rollout 结果打包为统一格式：(token_ids, mask, prompt_len, old_logps)
+    - prompt 部分 mask=0，response 部分保留原 mask
+    - 超长序列从右侧截断，确保 response 尾部完整
+    
+    **Phase 3: 前向计算当前策略的 log prob**
+    - 计算当前策略在每个 token 位置的 log probability
+    - 同时计算参考模型（冻结）的 log prob，用于 KL 散度约束
+    
+    **Phase 4: 构造 completion mask**
+    - 处理 EOS 截断：EOS 之后的 token 不参与 loss 计算
+    - 找到每个序列中第一个 EOS token 的位置，将其后 mask 置 0
+    
+    **Phase 5: 计算奖励**
+    - 调用 calculate_rewards 计算每个候选的奖励值
+    - 支持 debug 模式输出详细的生成内容和奖励信息
+    
+    **Phase 6: 计算 GRPO 组内优势 (Advantage)**
+    - GRPO 核心思想：同一 prompt 的 num_gen 个候选组成一组
+    - 组内标准化得到相对优势：advantages = (rewards - mean) / std
+    
+    **Phase 7: 计算 Policy Loss**
+    - KL 散度惩罚：使用 Schulman 近似公式 KL ≈ exp(r) - r - 1
+    - 重要性采样比 ratio = π_new / π_old
+    - 支持两种 loss 类型：
+      - CISPo：只 clamp ratio 上界，保守截断
+      - GRPO/PPO：双边截断 [1-ε, 1+ε]，取 min 实现悲观下界
+    
+    **Phase 8: 梯度累积与参数更新**
+    - 梯度累积：每 accumulation_steps 步更新一次参数
+    - 梯度裁剪、优化器步进、学习率调度
+    - 同步最新策略权重到 rollout 引擎（on-policy 要求）
     
     Args:
-        epoch: 当前 epoch
-        loader: 数据加载器
-        iters: 总迭代次数
-        rollout_engine: 推理引擎
-        ref_model: 参考模型
-        reward_model: 奖励模型（可选）
-        start_step: 起始步数
+        epoch: 当前 epoch 编号
+        loader: 数据加载器，提供训练批次
+        iters: 总迭代次数（用于日志显示）
+        rollout_engine: 推理引擎，负责生成候选响应
+        ref_model: 参考模型（冻结），用于 KL 散度约束
+        reward_model: 奖励模型（可选），用于无工具调用时的质量评分
+        start_step: 起始步数（断点续训时使用）
         wandb: wandb 日志记录器（可选）
-        use_sglang: 是否使用 SGLang 引擎
+        use_sglang: 是否使用 SGLang 引擎进行 rollout
     """
     last_step = start_step
     for step, batch in enumerate(loader, start=start_step + 1):

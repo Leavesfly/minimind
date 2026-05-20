@@ -51,18 +51,38 @@ warnings.filterwarnings('ignore')
 rep_penalty = compute_repetition_penalty
 
 
-# Critic 模型：继承自 CausalLM，将 lm_head 替换为 value_head，输出每个 token 的价值估计 V(s)
+# CriticModel 类：价值函数估计器（Value Function Estimator）
+# 在 Actor-Critic 架构中，Critic 负责估计状态价值 V(s)，用于计算优势函数和 TD 误差
+# 继承自 MiniMindForCausalLM，将语言模型的 lm_head 替换为 value_head
 class CriticModel(MiniMindForCausalLM):
     def __init__(self, params):
+        """
+        初始化 Critic 模型
+        
+        Args:
+            params: MiniMindConfig 配置对象，包含 hidden_size 等模型参数
+        """
         super().__init__(params)
-        # 替换lm_head为输出单一价值的线性层
+        # 替换 lm_head 为 value_head：输出每个 token 的状态价值估计 V(s)
+        # value_head 是一个线性层，将 hidden_state 映射到标量价值值
         self.value_head = nn.Linear(params.hidden_size, 1)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        # 使用基础模型获取隐藏状态
+        """
+        前向传播：计算输入序列中每个 token 的状态价值
+        
+        Args:
+            input_ids: 输入 token IDs，形状 [B, L]
+            attention_mask: 注意力掩码，形状 [B, L]
+            **kwargs: 其他传递给底层模型的参数
+        
+        Returns:
+            values: 每个 token 的价值估计，形状 [B, L]
+        """
+        # 使用基础 Transformer 模型获取隐藏状态
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden_states = self.model.norm(outputs[0])
-        # 使用value_head获取价值估计
+        # 通过 value_head 将隐藏状态映射为标量价值估计
         values = self.value_head(hidden_states).squeeze(-1)
         return values
 
@@ -116,25 +136,37 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
     """
     PPO 训练一个 epoch
     
-    PPO 训练流程：
-    1. Rollout: 使用当前 Actor 模型生成回答样本
-    2. 奖励计算: 使用多种奖励机制评估样本质量
-    3. GAE 优势估计: 使用广义优势估计计算优势值
-    4. Mini-batch 更新: 对同一批 rollout 数据进行多次 PPO 更新
-    5. KL 早停: 当策略偏离过大时提前停止更新
+    PPO (Proximal Policy Optimization) 是一种基于 Actor-Critic 架构的策略梯度算法。
+    本函数实现完整的 PPO 训练流程：
+    
+    训练流程概述：
+    1. Rollout 阶段：使用当前 Actor 策略模型生成回答样本（采样轨迹）
+    2. 奖励计算：结合规则奖励和 Reward Model 评分计算每个样本的总奖励
+    3. GAE 优势估计：使用广义优势估计 (Generalized Advantage Estimation) 计算优势值
+       - GAE 公式: A_t = δ_t + (γλ)δ_{t+1} + (γλ)^2 δ_{t+2} + ...
+       - 其中 δ_t = r_t + γV(s_{t+1}) - V(s_t) 是 TD 误差
+       - λ 参数控制偏差-方差权衡：λ=0 时为单步 TD，λ=1 时为蒙特卡洛
+    4. Mini-batch 更新：对同一批 rollout 数据进行多次 PPO 迭代更新
+       - Actor Loss (clipped surrogate objective): 
+         L^CLIP = E[min(r_t * A_t, clip(r_t, 1-ε, 1+ε) * A_t)]
+         其中 r_t = π_θ(a_t|s_t) / π_θ_old(a_t|s_t) 是概率比率
+       - Critic Loss (value function regression):
+         L^VF = E[(V_θ(s_t) - V_target)^2]，使用 clipped value loss 防止价值估计剧烈变化
+       - KL 散度惩罚：通过参考模型约束策略更新幅度
+    5. KL 早停：当近似 KL 散度超过阈值时提前停止当前 batch 的更新，防止策略偏离过大
     
     参数:
         epoch (int): 当前训练轮数
         loader (DataLoader): 数据加载器
         iters (int): 总迭代次数
         rollout_engine: Rollout 引擎（支持 torch 和 SGLang）
-        ref_model: 参考模型（用于 KL 散度计算）
+        ref_model: 参考模型（用于 KL 散度计算，保持固定不更新）
         actor_scheduler: Actor 学习率调度器
         critic_scheduler: Critic 学习率调度器
         reward_model: 奖励模型
-        start_step (int): 起始 step
+        start_step (int): 起始 step（用于断点续训）
         wandb: wandb 日志记录器
-        use_sglang (bool): 是否使用 SGLang 引擎
+        use_sglang (bool): 是否使用 SGLang 引擎进行 rollout
     """
     actor_model.train()
     critic_model.train()
@@ -188,43 +220,72 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         resp_policy_mask = ((resp_idx < resp_lengths.unsqueeze(1)) & resp_pad_mask).float()
         resp_value_mask = resp_policy_mask.clone()
 
-        with torch.no_grad():  # Rollout阶段只需推理获取old_logp和old_values，切断梯度省显存
+        # ==================== Phase 2: GAE 优势估计与返回值计算 ====================
+        # 在 no_grad 上下文中计算 old_logp、old_values 和 advantages，避免保留不必要的梯度图以节省显存
+        with torch.no_grad():
+            # 获取 Critic 模型（处理 DDP 包装）
             critic_for_rollout = critic_model.module if isinstance(critic_model,
                                                                    DistributedDataParallel) else critic_model
+            # 计算完整序列的价值估计 V(s)
             values_seq = critic_for_rollout(input_ids=gen_out, attention_mask=full_mask)
+            # 提取响应部分的价值估计，形状 [B, R]
             old_resp_values = values_seq[:, resp_start:-1] * resp_value_mask
 
+            # 获取 Actor 模型（处理 DDP 包装）
             actor_for_rollout = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
             with autocast_ctx:
+                # 前向传播获取 logits
                 logits = actor_for_rollout(input_ids=gen_out, attention_mask=full_mask).logits
 
+            # 计算旧策略的对数概率 log π_θ_old(a_t|s_t)，形状 [B, R]
             old_resp_logp = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)[
                 :, resp_start:]
 
+            # 计算参考模型的对数概率 log π_ref(a_t|s_t)，用于 KL 散度惩罚
             ref_logp_all = F.log_softmax(ref_model(input_ids=gen_out, attention_mask=full_mask).logits[:, :-1],
                                          dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)
             ref_resp_logp = ref_logp_all[:, resp_start:]
+
+            # 构建 token 级别的奖励信号：仅在最后一个有效 token 位置加上外部奖励
             token_rewards = torch.zeros_like(old_resp_logp)
-            last_idx = resp_lengths - 1  # [B]
+            last_idx = resp_lengths - 1  # [B]，每个样本最后一个有效 token 的位置
             token_rewards[torch.arange(B, device=args.device), last_idx] += rewards  # 末尾加外部奖励
 
-            gen_len = old_resp_values.size(1);
-            lastgaelam = torch.zeros(B, device=args.device);
-            advs_rev = []
+            # ==================== GAE (Generalized Advantage Estimation) 计算 ====================
+            # GAE 通过结合多步 TD 误差来平衡偏差和方差
+            # TD 误差公式: δ_t = r_t + γV(s_{t+1}) - V(s_t)
+            # GAE 公式: A_t^GAE(λ) = Σ_{l=0}^{T-t-1} (γλ)^l δ_{t+l}
+            #   - γ (gamma): 折扣因子，控制未来奖励的重要性
+            #   - λ (lam): GAE 参数，控制偏差-方差权衡
+            #     λ=0: 单步 TD，低方差高偏差
+            #     λ=1: 蒙特卡洛，低偏差高方差
+            gen_len = old_resp_values.size(1)
+            lastgaelam = torch.zeros(B, device=args.device)  # 初始化最后一个时间步的 GAE 值
+            advs_rev = []  # 存储反向计算的 advantage 值
             for t in reversed(range(gen_len)):
+                # 获取下一个时间步的价值估计 V(s_{t+1})，如果是最后一步则为 0
                 nv = old_resp_values[:, t + 1] if t < gen_len - 1 else 0.0
+                # 计算 TD 误差: δ_t = r_t + γV(s_{t+1}) - V(s_t)
                 delta = token_rewards[:, t] + args.gamma * nv - old_resp_values[:, t]
+                # 递推计算 GAE: A_t = δ_t + γλ * A_{t+1}
                 lastgaelam = delta + args.gamma * args.lam * lastgaelam
                 advs_rev.append(lastgaelam)
+            # 反转列表并堆叠，得到形状 [B, R] 的优势值
             advantages = torch.stack(advs_rev[::-1], dim=1)  # [B, R]
+            # 计算返回值 (returns/target values): V_target = A + V_old
             returns = advantages + old_resp_values  # [B, R]
 
+            # 对优势值进行标准化（按 batch 归一化），提高训练稳定性
             adv_mean = (advantages * resp_policy_mask).sum() / resp_policy_mask.sum().clamp(min=1)
             adv_var = ((advantages - adv_mean) ** 2 * resp_policy_mask).sum() / resp_policy_mask.sum().clamp(min=1)
+            # 标准化公式: A_normalized = (A - mean) / sqrt(var + ε)
             advantages = (advantages - adv_mean) * torch.rsqrt(adv_var + 1e-8) * resp_policy_mask
 
-        mb_size = max(1, min(args.mini_batch_size, B))
-        stop_ppo = False
+        # ==================== Phase 3: Mini-batch PPO 更新循环 ====================
+        # 对同一批 rollout 数据进行多次迭代更新（ppo_update_iters 次），每次使用不同的 mini-batch
+        mb_size = max(1, min(args.mini_batch_size, B))  # 实际 mini-batch 大小
+        stop_ppo = False  # KL 早停标志
+        # 用于累计统计信息的变量
         policy_loss_sum = 0.0
         value_loss_sum = 0.0
         kl_sum = 0.0
@@ -232,27 +293,38 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
         clipfrac_sum = 0.0
         aux_loss_sum = 0.0
         log_count = 0
+        # 获取未包装的模型实例（处理 DDP 包装）
         actor_unwrapped = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
         critic_unwrapped = critic_model.module if isinstance(critic_model, DistributedDataParallel) else critic_model
+        
+        # PPO 多轮更新：对同一批 rollout 数据重复更新 ppo_update_iters 次
         for ppo_epoch in range(args.ppo_update_iters):
             if stop_ppo:
-                break
+                break  # KL 散度超过阈值，提前停止更新
+            # 随机打乱样本索引，实现 mini-batch 的随机采样
             b_inds = torch.randperm(B, device=args.device)
             for i in range(0, B, mb_size):
-                inds = b_inds[i:i + mb_size]
+                inds = b_inds[i:i + mb_size]  # 当前 mini-batch 的样本索引
 
+                # --- Critic 前向传播：计算当前策略下的价值估计 ---
                 mb_values_seq = critic_unwrapped(input_ids=gen_out[inds], attention_mask=full_mask[inds])
-                mb_resp_values = mb_values_seq[:, resp_start:-1]
+                mb_resp_values = mb_values_seq[:, resp_start:-1]  # 提取响应部分的价值估计
 
+                # --- Actor 前向传播：计算当前策略下的对数概率 ---
                 with autocast_ctx:
                     res = actor_unwrapped(input_ids=gen_out[inds], attention_mask=full_mask[inds])
+                    # MoE 模型的辅助损失（负载均衡损失）
                     aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
 
+                # 计算当前策略的对数概率 log π_θ(a_t|s_t)
                 mb_logp_all = F.log_softmax(res.logits[:, :-1], dim=-1).gather(2, labels[inds].unsqueeze(-1)).squeeze(
                     -1)
                 mb_resp_logp = mb_logp_all[:, resp_start:]
 
+                # ==================== 计算 PPO 核心指标 ====================
+                # 概率比率的对数: log(π_θ / π_θ_old)
                 log_ratio = mb_resp_logp - old_resp_logp[inds]
+                # 近似 KL 散度: D_KL ≈ 0.5 * (log_ratio)^2（二阶泰勒展开近似）
                 approx_kl = (0.5 * (log_ratio ** 2) * resp_policy_mask[inds]).sum() / resp_policy_mask[
                     inds].sum().clamp(min=1)
 
@@ -261,20 +333,40 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
                 if dist.is_initialized():
                     dist.all_reduce(approx_kl_val, op=dist.ReduceOp.AVG)
 
+                # KL 早停检查：如果近似 KL 散度超过阈值，标记停止更新
                 if approx_kl_val > args.early_stop_kl:
                     stop_ppo = True
 
+                # 概率比率: r_t = π_θ(a_t|s_t) / π_θ_old(a_t|s_t) = exp(log_ratio)
                 ratio = torch.exp(log_ratio)
+                # Clip 比例：被裁剪的样本占比，用于监控 PPO 裁剪效果
                 clipfrac = ((((ratio - 1.0).abs() > args.clip_epsilon).float() * resp_policy_mask[inds]).sum()
                             / resp_policy_mask[inds].sum().clamp(min=1))
+                
+                # KL 参考惩罚项：使用参考模型约束策略偏离
+                # 公式: D_KL(π_ref || π_θ) ≈ exp(log π_ref - log π_θ) - (log π_ref - log π_θ) - 1
                 kl_ref_penalty = ((torch.exp(ref_resp_logp[inds] - mb_resp_logp) - (
                         ref_resp_logp[inds] - mb_resp_logp) - 1.0)
                                   * resp_policy_mask[inds]).sum() / resp_policy_mask[inds].sum().clamp(min=1)
+                
+                # ==================== Actor Loss (Clipped Surrogate Objective) ====================
+                # PPO 的核心创新：通过裁剪概率比率来限制策略更新幅度
+                # L^CLIP = E[min(r_t * A_t, clip(r_t, 1-ε, 1+ε) * A_t)]
+                #   - 当 advantage > 0 时，希望增大概率比率，但上限为 1+ε
+                #   - 当 advantage < 0 时，希望减小概率比率，但下限为 1-ε
+                #   - 取 min 确保不会过度优化被裁剪的部分
                 policy_loss = ((torch.max(-advantages[inds] * ratio,
                                           -advantages[inds] * torch.clamp(ratio, 1.0 - args.clip_epsilon,
                                                                           1.0 + args.clip_epsilon))
                                 * resp_policy_mask[inds]).sum() / resp_policy_mask[inds].sum().clamp(min=1)
-                               + args.kl_coef * kl_ref_penalty)
+                               + args.kl_coef * kl_ref_penalty)  # 加上 KL 参考惩罚项
+                
+                # ==================== Critic Loss (Clipped Value Loss) ====================
+                # 价值函数回归损失，使用 clipped value loss 防止价值估计剧烈变化
+                # L^VF = 0.5 * E[max((V_θ - V_target)^2, (clip(V_θ, V_old-δ, V_old+δ) - V_target)^2)]
+                #   - 第一项：直接的价值预测误差
+                #   - 第二项：裁剪后的价值预测误差，限制价值估计的变化范围
+                #   - 取 max 确保损失不会被低估
                 value_loss = 0.5 * (torch.max((mb_resp_values - returns[inds]) ** 2,
                                               (torch.clamp(mb_resp_values, old_resp_values[inds] - args.cliprange_value,
                                                            old_resp_values[inds] + args.cliprange_value) - returns[
@@ -286,12 +378,17 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
 
                 # 早停时必须保证 forward-backward 闭环，故只截断 loss 不中断 DDP 通信
                 if stop_ppo:
+                    # KL 散度超过阈值时，将 loss 置零以避免策略进一步偏离，但仍执行 backward 保持 DDP 同步
                     loss = (policy_loss + args.vf_coef * value_loss + aux_loss) * 0.0
                 else:
+                    # 正常更新：计算总损失并考虑梯度累积
+                    # 总损失 = Actor Loss + vf_coef * Critic Loss + MoE 辅助损失
                     loss = (policy_loss + args.vf_coef * value_loss + aux_loss) / args.accumulation_steps
 
+                # 反向传播计算梯度
                 loss.backward()
 
+                # 累计统计信息用于日志输出
                 policy_loss_sum += policy_loss.item()
                 value_loss_sum += value_loss.item()
                 kl_sum += kl.item()
@@ -302,20 +399,31 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
 
                 grad_accum_step += 1
 
+                # 梯度累积：每 accumulation_steps 步执行一次参数更新
                 if grad_accum_step % args.accumulation_steps == 0:
+                    # 梯度裁剪：防止梯度爆炸
                     clip_grad_norm_(actor_model.parameters(), args.grad_clip)
                     clip_grad_norm_(critic_model.parameters(), args.grad_clip)
+                    # 更新 Actor 和 Critic 模型参数
                     actor_optimizer.step()
                     critic_optimizer.step()
+                    # 更新学习率调度器
                     actor_scheduler.step()
                     critic_scheduler.step()
+                    # 清零梯度
                     actor_optimizer.zero_grad()
                     critic_optimizer.zero_grad()
 
+        # 处理最后一个不完整的梯度累积批次
         if grad_accum_step % args.accumulation_steps != 0:
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
             actor_optimizer.step()
+            critic_optimizer.step()
+            actor_scheduler.step()
+            critic_scheduler.step()
+            actor_optimizer.zero_grad()
+            critic_optimizer.zero_grad()
             critic_optimizer.step()
             actor_scheduler.step()
             critic_scheduler.step()

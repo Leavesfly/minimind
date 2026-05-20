@@ -1,3 +1,50 @@
+"""
+MiniMind LoRA 微调训练脚本
+
+本脚本实现基于 LoRA（Low-Rank Adaptation）的参数高效微调方法。
+
+## 功能说明
+LoRA 是一种参数高效的微调技术，通过在预训练模型的权重矩阵中插入低秩分解矩阵，
+仅训练这些低秩矩阵而冻结原始模型参数。相比全量微调，LoRA 具有以下优势：
+- 参数量极少：通常只占原模型参数的 0.1%~1%
+- 存储效率高：只需保存 LoRA 权重，大幅减少 checkpoint 大小
+- 避免灾难性遗忘：冻结基础模型参数，保留预训练知识
+- 快速切换：可以为不同任务训练不同的 LoRA 适配器，推理时动态加载
+
+## 训练算法
+1. **LoRA 注入**：在模型的线性层（如 attention 的 q_proj、v_proj）旁路插入低秩矩阵 A 和 B
+2. **参数冻结**：冻结所有非 LoRA 参数，仅收集包含 'lora' 关键字的参数用于优化
+3. **前向传播**：输出 = 原始权重 @ 输入 + B @ A @ 输入（LoRA 旁路）
+4. **反向传播**：梯度仅通过 LoRA 参数回传，基础模型参数不更新
+5. **权重保存**：仅保存 LoRA 权重（A 和 B 矩阵），不包含基础模型
+
+## 使用方式
+```bash
+# 基本用法
+python trainer/train_lora.py \
+    --data_path ../.dataset/lora_medical.jsonl \
+    --lora_name lora_medical \
+    --epochs 10 \
+    --batch_size 16 \
+    --learning_rate 1e-4
+
+# 从检查点恢复训练
+python trainer/train_lora.py \
+    --from_resume 1 \
+    --lora_name lora_medical
+
+# 启用 WandB 日志
+python trainer/train_lora.py \
+    --use_wandb \
+    --wandb_project MiniMind-LoRA
+```
+
+## 关键参数说明
+- `--lora_name`: LoRA 权重名称，用于区分不同任务的适配器
+- `--from_weight`: 基础模型权重来源，默认为 full_sft（监督微调后的模型）
+- `--accumulation_steps`: 梯度累积步数，等效于增大 batch size
+- `--grad_clip`: 梯度裁剪阈值，防止梯度爆炸
+"""
 import os
 import sys
 
@@ -63,7 +110,10 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
         with autocast_ctx:
             res = model(input_ids, labels=labels)
+            # 总损失 = 语言建模损失（logits loss）+ 辅助损失（如 MoE 的负载均衡损失）
+            # aux_loss 仅在启用 MoE 架构时非零，用于平衡专家路由的负载分布
             loss = res.loss + res.aux_loss
+            # 梯度累积：将损失除以累积步数，使得多次 backward 的梯度累加后等效于大 batch size
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -71,6 +121,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             # LoRA 特有：仅对 LoRA 参数进行梯度裁剪
+            # 由于只有 lora_params 需要更新，梯度裁剪也仅应用于这些参数
+            # 梯度裁剪防止梯度爆炸，确保训练稳定性，尤其在混合精度训练中尤为重要
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
@@ -92,8 +144,13 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             lora_save_path = f'{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}.pth'
-            # LoRA只保存LoRA权重
+            # LoRA 只保存 LoRA 权重（A 和 B 矩阵），不包含基础模型参数
+            # 这样做的好处：
+            # 1. 存储空间极小：一个 LoRA 适配器通常只有几 MB 到几十 MB
+            # 2. 便于管理：可以为不同任务保存多个 LoRA 适配器，按需加载
+            # 3. 快速部署：推理时只需加载基础模型 + 对应的 LoRA 适配器
             save_lora(model, lora_save_path)
+            # 同时保存完整的训练状态（包括 optimizer、scaler、epoch、step 等），支持断点续训
             lm_checkpoint(lm_config, weight=args.lora_name, model=model, optimizer=optimizer, scaler=scaler,
                           epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
@@ -162,9 +219,13 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     # LoRA 特有：在模型中插入 LoRA 适配器
+    # apply_lora 会遍历模型的所有线性层，在符合条件的层（如 attention 的投影层）旁路插入低秩矩阵
+    # LoRA 的核心思想：W' = W + BA，其中 W 是冻结的原始权重，B 和 A 是可训练的低秩矩阵
+    # rank r << min(hidden_dim, output_dim)，因此参数量大幅减少
     apply_lora(model)
 
     # LoRA 特有：统计参数量，展示 LoRA 的参数效率
+    # 通过对比总参数量和 LoRA 参数量，直观展示参数高效微调的优势
     total_params = sum(p.numel() for p in model.parameters())
     lora_params_count = sum(p.numel() for name, p in model.named_parameters() if 'lora' in name)
     Logger(f"LLM 总参数量: {total_params / 1e6:.3f} M")
@@ -172,12 +233,25 @@ if __name__ == "__main__":
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
 
     # LoRA 特有：冻结非LoRA参数，仅收集LoRA参数用于优化
+    # 为什么冻结非 LoRA 参数？
+    # 1. 保留预训练知识：基础模型已在大规模语料上预训练，包含丰富的语言知识和世界知识
+    # 2. 避免灾难性遗忘：如果更新全部参数，小数据集上的微调会导致模型忘记预训练阶段学到的通用能力
+    # 3. 参数高效：仅训练低秩分解矩阵（A 和 B），参数量通常不到原模型的 1%，大幅降低显存占用和训练时间
+    # 4. 模块化设计：不同任务可以训练独立的 LoRA 适配器，推理时按需加载，无需维护多个完整模型副本
+    #
+    # 为什么只训练低秩分解矩阵？
+    # - 理论依据：预训练模型的权重矩阵具有低内在维度，微调时的权重更新可以用低秩矩阵近似
+    # - 数学形式：ΔW = BA，其中 B ∈ R^(d×r), A ∈ R^(r×k)，r 为秩（通常设为 8、16、64 等小值）
+    # - 训练时：固定 W，仅优化 B 和 A；推理时：将 BA 合并到 W 中，无额外推理开销
     lora_params = []
     for name, param in model.named_parameters():
         if 'lora' in name:
+            # LoRA 参数设置为可训练，这些参数将在反向传播中接收梯度并更新
             param.requires_grad = True
             lora_params.append(param)
         else:
+            # 非 LoRA 参数（即基础模型参数）冻结，不参与梯度计算和更新
+            # 这样可以确保预训练知识不被破坏，同时大幅减少需要优化的参数量
             param.requires_grad = False
 
     # ========== 6. 定义数据和优化器 ==========
@@ -187,6 +261,8 @@ if __name__ == "__main__":
     scaler = torch.amp.GradScaler(device="cuda", enabled=use_scaler) if device_type == "cuda" else torch.amp.GradScaler(
         enabled=False)
     # LoRA 特有：优化器仅优化 LoRA 参数
+    # 传入 lora_params 而非 model.parameters()，确保只有 LoRA 矩阵（A 和 B）被更新
+    # 这样可以在保持基础模型不变的前提下，让模型适应特定任务的数据分布
     optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
 
     # ========== 7. 从 ckp 恢复状态（LoRA 用 strict=False 允许部分加载） ==========

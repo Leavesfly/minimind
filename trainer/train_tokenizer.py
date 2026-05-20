@@ -14,39 +14,71 @@ SPECIAL_TOKENS_NUM = 36
 def get_texts(data_path):
     """从数据文件中读取文本内容
     
+    该函数从 JSONL 格式的对话数据中提取所有 conversation 的 content 字段，
+    并将它们拼接为纯文本供 tokenizer 训练使用。
+    
     Args:
-        data_path: 数据文件路径（JSONL 格式）
+        data_path: 数据文件路径（JSONL 格式），每行应包含 conversations 字段
     
     Yields:
-        文本内容字符串
+        str: 拼接后的文本内容字符串，每条对话的多轮内容用换行符连接
+    
+    注意：
+        - 仅取前 10000 行用于快速测试，生产环境可移除此限制
+        - 使用 errors='ignore' 跳过无法解码的字符，保证训练不中断
     """
     with open(data_path, 'r', encoding='utf-8', errors='ignore') as f:
         for i, line in enumerate(f):
-            if i >= 10000:  # 仅取前 10000 行用于测试训练
+            # 限制读取行数，仅用于快速测试训练流程
+            if i >= 10000:
                 break
             try:
+                # 解析 JSONL 行，提取 conversations 中的所有 content
                 data = json.loads(line)
                 contents = [item.get('content') for item in data.get('conversations', []) if item.get('content')]
                 if contents:
+                    # 将多轮对话内容拼接为一个文本块，用换行符分隔
                     yield "\n".join(contents)
             except json.JSONDecodeError:
+                # 跳过格式错误的行，保证训练过程健壮性
                 continue
 
 
 def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPECIAL_TOKENS_NUM):
-    """训练自定义分词器
+    """训练自定义 BPE 分词器
     
-    从语料文件中训练 BPE 分词器，并保存到指定目录
+    本函数实现完整的 Tokenizer 训练流程：
+    1. 初始化 BPE 模型和 ByteLevel 预分词器
+    2. 定义特殊 token 列表（聊天标记、多模态标记、工具调用标记等）
+    3. 使用 BpeTrainer 在语料上训练词表和合并规则
+    4. 保存 tokenizer 模型文件和 HuggingFace 兼容的配置文件
+    
+    BPE (Byte-Pair Encoding) 算法原理：
+    - 从字符级别开始，迭代合并最频繁的相邻 token 对
+    - 通过控制合并次数来控制最终词表大小
+    - ByteLevel 确保可以编码任意 Unicode 字符，避免 unk token
     
     Args:
-        data_path: 训练语料文件路径
-        tokenizer_dir: 分词器保存目录
-        vocab_size: 词表大小
-        special_tokens_num: 特殊 token 数量
+        data_path: 训练语料文件路径（JSONL 格式）
+        tokenizer_dir: 分词器保存目录，将生成 tokenizer.json、merges.txt、vocab.json
+        vocab_size: 目标词表大小，BPE 合并后保留的 token 数量
+        special_tokens_num: 特殊 token 总数，包括预留 buffer
+    
+    使用示例：
+        train_tokenizer('../data/train.jsonl', '../tokenizer/', vocab_size=6400)
     """
+    # 初始化 BPE 模型：基于字节对的迭代合并算法
     tokenizer = Tokenizer(models.BPE())
+    # 设置 ByteLevel 预分词器：将文本转换为字节序列，确保所有 Unicode 字符可编码
+    # add_prefix_space=False 表示不在句首添加空格，保持原始文本格式
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
 
+    # 定义特殊 token 列表，包含聊天标记、多模态占位符、缅甸语字符等
+    # 这些 token 用于处理特定场景：
+    # - <|im_start|>/<|im_end|>: 对话边界标记
+    # - ￼//￭/￯: Unicode 替换字符和对象替换符
+    # - ﴾/﴿: 阿拉伯语括号（某些文本中可能出现）
+    # - ဝ/ဝး/ဝ်/ပ/ဖ/ြ/ွ/ှ/့/၌: 缅甸语字符（支持多语言分词）
     special_tokens_list = [
         "<|endoftext|>", "<|im_start|>", "<|im_end|>",
         "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>",
@@ -55,25 +87,44 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         "<tts_text_bos_single>"
     ]
 
+    # 定义额外功能标记，用于工具调用和思维链
+    # - <tool_call>/</tool_call>: 工具调用开始/结束标记
+    # - <tool_response>/</tool_response>: 工具执行结果标记
+    # - : 思维链推理标记
     additional_tokens_list = [
         "<tool_call>", "</tool_call>",
         "<tool_response>", "</tool_response>",
         "<think>", "</think>"
     ]
+    # 计算需要预留的 buffer token 数量，确保总特殊 token 数等于 special_tokens_num
+    # buffer token 用于未来扩展，避免重新训练 tokenizer
     num_buffer = special_tokens_num - len(special_tokens_list + additional_tokens_list)
     buffer_tokens = [f"<|buffer{i}|>" for i in range(1, num_buffer + 1)]  # 预留一定数量的token位置
+    
+    # 合并所有特殊 token：基础特殊 token + 功能 token + buffer token
     all_special_tokens = special_tokens_list + additional_tokens_list + buffer_tokens
+    # 初始化 BPE 训练器
+    # - vocab_size: 目标词表大小
+    # - initial_alphabet: 使用 ByteLevel 预分词器的字母表，确保所有 Unicode 字符可编码
+    # - special_tokens: 注册所有特殊 token，使其不被拆分
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
         show_progress=True,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         special_tokens=all_special_tokens
     )
+    # 从数据路径提取纯文本语料
     texts = get_texts(data_path)
+    
+    # 在语料上训练 BPE 模型，学习词表和合并规则
     tokenizer.train_from_iterator(texts, trainer=trainer)
+    # 设置解码器为 ByteLevel，确保解码时正确处理字节级编码
     tokenizer.decoder = decoders.ByteLevel()
+    
+    # 将特殊 token 添加到 tokenizer 词汇表中
     tokenizer.add_special_tokens(special_tokens_list)
 
+    # 创建保存目录并保存 tokenizer 模型
     os.makedirs(tokenizer_dir, exist_ok=True)
     tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
     tokenizer.model.save(tokenizer_dir)
