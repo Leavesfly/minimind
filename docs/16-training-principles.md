@@ -59,6 +59,29 @@
 
 padding 位置标记为 -100，不参与 loss 计算。就这么简单。
 
+### 输入 / 标签 / 损失 Demo
+
+```python
+# ━━━ 原始数据（.dataset/pretrain_t2t_mini.jsonl）━━━
+{"text": "今天天气很好，适合出去散步"}
+
+# ━━━ 输入 (input_ids) ━━━
+# tokenize + 添加 bos/eos + padding 到 max_length
+input_ids = [BOS, 今, 天, 天, 气, 很, 好, ，, 适, 合, 出, 去, 散, 步, EOS, PAD, PAD]
+
+# ━━━ 标签 (labels) ━━━
+# 与 input_ids 等长，padding 位置标记为 -100
+labels    = [BOS, 今, 天, 天, 气, 很, 好, ，, 适, 合, 出, 去, 散, 步, EOS, -100, -100]
+
+# ━━━ 模型内部 shift ━━━
+# logits[:-1] 预测 labels[1:]，即位置 i 的输出预测位置 i+1 的 token
+# logits[0]→预测"今"  logits[1]→预测"天"  ...  logits[13]→预测 EOS
+
+# ━━━ 损失计算 ━━━
+loss = CrossEntropy(logits[:-1], labels[1:], ignore_index=-100)
+# 所有非 padding 位置均参与 loss 计算（全量学习语言规律）
+```
+
 ---
 
 ## 二、监督微调（SFT）—— 学会对话的格式
@@ -95,6 +118,33 @@ padding 位置标记为 -100，不参与 loss 计算。就这么简单。
 
 如果对 user 部分也计算 loss，模型会学习"如何提问"，这不是我们要的。只标注 assistant 回复为有效 label，模型只学习"如何回答"。
 
+### 输入 / 标签 / 损失 Demo
+
+```python
+# ━━━ 原始数据（.dataset/sft_t2t_mini.jsonl）━━━
+{"conversations": [
+    {"role": "user", "content": "什么是AI？"},
+    {"role": "assistant", "content": "AI是人工智能的缩写"}
+]}
+
+# ━━━ 输入 (input_ids) ━━━
+# 经 chat_template 编码后的完整序列
+input_ids = [<|im_start|>, user, \n, 什, 么, 是, AI, ？, <|im_end|>, \n,
+             <|im_start|>, assistant, \n, AI, 是, 人, 工, 智, 能, 的, 缩, 写, <|im_end|>, \n, PAD]
+
+# ━━━ 标签 (labels) ━━━
+# 只有 assistant 回复区域保留真实 token id，其余为 -100
+labels    = [-100, -100, -100, -100, -100, -100, -100, -100, -100, -100,  # user 部分
+             -100, -100, -100,                                            # <|im_start|>assistant\n
+             AI, 是, 人, 工, 智, 能, 的, 缩, 写, <|im_end|>, \n,         # ← 只有这里计算 loss
+             -100]                                                        # PAD
+
+# ━━━ 损失计算 ━━━
+# 模型内部 shift: logits[:-1] vs labels[1:]
+loss = CrossEntropy(logits[:-1], labels[1:], ignore_index=-100)
+# 只在 assistant 回答部分计算 loss（user/system/特殊标记全部忽略）
+```
+
 ---
 
 ## 三、LoRA —— 用 0.1% 的参数学会新技能
@@ -128,6 +178,24 @@ LoRA 做的就是这件事：冻结整个模型（你已有的绘画技能），
 ### 在 MiniMind3 中
 
 `lora_identity.jsonl`（22KB，90 条数据）就能让模型知道自己叫 MiniMind。这就是 LoRA 的威力——极少数据 + 极少参数 = 精准能力植入。
+
+### 输入 / 标签 / 损失 Demo
+
+```python
+# ━━━ 输入/标签 ━━━
+# 与 SFT 完全相同！数据格式一样，loss 计算一样
+input_ids = [完整的多轮对话 token 序列]  # 与 SFT 相同
+labels    = [只有 assistant 部分非 -100]       # 与 SFT 相同
+
+# ━━━ 区别在于“谁被训练” ━━━
+# 冻结全部原始权重 W (512×512)
+# 只训练 LoRA adapter: A (512×16) × B (16×512)
+# 可训练参数: 16,384 个 vs 原始 262,144 个（减少 93%）
+
+# ━━━ 损失计算 ━━━
+loss = CrossEntropy(logits[:-1], labels[1:], ignore_index=-100)
+# 与 SFT 完全相同，但梯度只更新 LoRA 参数（A 和 B 矩阵）
+```
 
 ---
 
@@ -188,6 +256,29 @@ loss = -log σ(β × (好的改善幅度 - 差的改善幅度))
 
 模型学到的不是"记住好回答"，而是"理解什么样的回答风格是好的"。
 
+### 输入 / 标签 / 损失 Demo
+
+```python
+# ━━━ 输入 ━━━
+# 拼接 chosen 和 rejected → x = cat([x_chosen, x_rejected])
+x_chosen   = tokenize("完整对话: user+好回答")[:-1]   # shape [seq_len]
+x_rejected = tokenize("完整对话: user+差回答")[:-1]   # shape [seq_len]
+x = cat([x_chosen, x_rejected])               # shape [batch*2, seq_len]
+
+# ━━━ 标签 ━━━
+# next-token 标签 + 只在 assistant 区域的 mask
+y_chosen / y_rejected = tokenize("...")[1:]    # shift 1 token
+mask_chosen / mask_rejected: 仅 assistant 部分为 1，其余为 0
+
+# ━━━ 损失计算 ━━━
+# 1. 参考模型(冻结): ref_log_probs = Σ log P_ref(y|x) * mask
+# 2. 策略模型(训练): policy_log_probs = Σ log P_π(y|x) * mask
+# 3. DPO loss:
+pi_logratio  = Σ log P_π(chosen) - Σ log P_π(rejected)
+ref_logratio = Σ log P_ref(chosen) - Σ log P_ref(rejected)
+loss = -log σ(β × (pi_logratio - ref_logratio))    # β=0.15
+```
+
 ---
 
 ## 五、知识蒸馏（Distillation）—— 站在巨人肩膀上
@@ -227,6 +318,29 @@ T=2：[0.6, 0.2, 0.12, 0.08]   → 分布变平滑，暗知识暴露出来了
 - KL 部分：跟老师学（学习暗知识）
 - CE 部分：跟答案学（保证基本正确性）
 - α=0.5：两者各占一半，平衡探索与稳定
+
+### 输入 / 标签 / 损失 Demo
+
+```python
+# ━━━ 输入 (input_ids) ━━━
+# 与 SFT 相同的 chat template 编码序列
+input_ids = [<|im_start|>, user, ..., <|im_start|>, assistant, ..., <|im_end|>, PAD]
+
+# ━━━ 标签（双重标签） ━━━
+# Hard Label: 与 SFT 相同的 labels（只有 assistant 区域非 -100）
+labels      = [-100, ..., AI, 是, 人, 工, ..., -100]
+# Soft Label: 教师模型输出的概率分布（整个词表上的分布）
+teacher_dist = softmax(teacher_logits / T)   # T=1.5 软化温度
+
+# ━━━ 损失计算 ━━━
+# 学生 logits: student_logits = model(input_ids).logits[:-1]
+# 教师 logits: teacher_logits = teacher_model(input_ids).logits[:-1]  (no_grad)
+ce_loss = CrossEntropy(student_logits, shift_labels, ignore_index=-100)
+kl_loss = KL(log_softmax(student_logits/T), softmax(teacher_logits/T)) × T²
+
+total_loss = α × ce_loss + (1-α) × kl_loss     # α=0.5, T=1.5
+#            ↑ 跟答案学         ↑ 跟老师学
+```
 
 ---
 
@@ -282,7 +396,37 @@ PPO 的核心创新是 clip 机制：
 总奖励 = 长度奖励(±0.5) + 思考奖励(+1.0/-0.5) + 格式奖励(+0.25) - 重复惩罚 + RM评分
 ```
 
-多个奖励维度协同工作，让模型学会：写适当长度的回答、先思考再作答、不重复啰嗦。
+多个奖励维度协同工作，让模型学会：写适当长度的回答、先思考再作答、不重复罗嗦。
+
+### 输入 / 标签 / 损失 Demo
+
+```python
+# ━━━ 输入 ━━━
+# 只有 prompt（问题部分），由模型自己生成回答
+prompt = "<|im_start|>user\n请解释量子计算<|im_end|>\n<|im_start|>assistant\n"
+
+# ━━━ 标签（来自奖励信号，非固定标签） ━━━
+# Step 1: Rollout - 模型自己生成回答
+response = "<think>让我想想...</think>\n量子计算利用量子力学原理..."
+# Step 2: 计算奖励
+reward = 长度奖励(+0.5) + 思考奖励(+1.0) + 格式奖励(+0.25) - 重复惩罚 + RM评分
+# Step 3: GAE 优势估计 - 将奖励分配到每个 token
+advantages[t] = δ_t + γλ·δ_{t+1} + (γλ)²·δ_{t+2} + ...
+# 其中 δ_t = reward_t + γ·V(s_{t+1}) - V(s_t)   (TD 误差)
+
+# ━━━ 损失计算 ━━━
+# Actor Loss (PPO Clip):
+ratio = exp(log P_new(token) - log P_old(token))
+actor_loss = -min(ratio × advantage, clip(ratio, 1-ε, 1+ε) × advantage)
+
+# Critic Loss (Value Function):
+critic_loss = (V_pred - V_target)²
+
+# KL 惩罚:
+kl_penalty = log P_new - log P_ref
+
+total_loss = actor_loss + 0.5 × critic_loss + β × kl_penalty
+```
 
 ---
 
@@ -334,6 +478,36 @@ MiniMind3 中还实现了 CISPO（Constrained Importance Sampling Policy Optimiz
 ```
 
 相当于给 GRPO 也加了一条安全带，防止单次更新过大。
+
+### 输入 / 标签 / 损失 Demo
+
+```python
+# ━━━ 输入 ━━━
+prompt = "<|im_start|>user\n今天天气怎么样？<|im_end|>\n<|im_start|>assistant\n"
+
+# ━━━ 标签（组内相对排名，非固定标签） ━━━
+# 对同一 prompt 生成 G=6 个回答，互相比较
+responses = [response_1, response_2, ..., response_6]  # 6 个候选
+rewards   = [1.2, 0.8, 2.1, -0.3, 1.5, 0.9]           # 各自奖励
+
+# 组内标准化（替代 Critic）：
+mean_r = mean(rewards) = 1.03
+std_r  = std(rewards)  = 0.73
+advantages = (rewards - mean_r) / std_r  # = [0.23, -0.32, 1.46, -1.82, 0.64, -0.18]
+
+# ━━━ 损失计算 ━━━
+ratio = exp(log P_new(token) - log P_old(token))
+
+# GRPO 模式 (PPO clip):
+loss = -min(ratio × adv, clip(ratio, 1-ε, 1+ε) × adv) + β × KL
+
+# CISPO 模式 (单侧截断):
+clamped_ratio = clamp(ratio, max=5.0).detach()
+loss = -(clamped_ratio × advantage × log P_new) + β × KL
+
+# 最终: 按 completion_mask 加权平均
+policy_loss = Σ(per_token_loss × mask) / Σ(mask)
+```
 
 ---
 
@@ -397,6 +571,35 @@ Agent RL 的奖励包括多个维度：
 - **工具选择正确性**：是否调用了正确的工具
 - **参数正确性**：传入的参数是否有效
 - **最终答案正确性**：与 `gt` 对比的结果
+
+### 输入 / 标签 / 损失 Demo
+
+```python
+# ━━━ 输入 ━━━
+messages = [
+    {"role": "system", "content": "", "tools": "[calculate_math, get_weather, ...]"},
+    {"role": "user", "content": "算算 7109 × 2920"}
+]
+gt = ["20758280"]  # ground truth
+
+# ━━━ 标签（多轮交互 + 奖励信号，非固定标签） ━━━
+# 第1轮: 模型生成 → "<tool_call>{...}</tool_call>"
+#   response_mask = [1,1,1,...,1]   ← 模型生成，参与 loss
+# 环境执行 → tool 返回 '{"result":"20758280"}'
+#   response_mask = [0,0,0,...,0]   ← 环境反馈，不参与 loss
+# 第2轮: 模型继续生成 → "7109 × 2920 = 20758280"
+#   response_mask = [1,1,1,...,1]   ← 模型生成，参与 loss
+
+# 奖励（多维度）:
+reward = 格式正确(+0.6) + 选对工具(+0.8) + 参数正确(+0.5) + gt匹配(+1.0) - 重复惩罚
+
+# ━━━ 损失计算 ━━━
+# 与 GRPO 相同的策略优化，但只在 response_mask=1 的位置计算
+ratio = exp(log P_new - log P_old) * response_mask
+clamped_ratio = clamp(ratio, max=5.0).detach()
+loss = -(clamped_ratio × advantage × log P_new) + β × KL
+# 模型生成的 token (mask=1) 参与策略梯度，工具返回的 token (mask=0) 不参与
+```
 
 ---
 
